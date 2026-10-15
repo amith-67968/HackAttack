@@ -11,11 +11,11 @@ class ProgressHub:
         self._events: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._next_id: dict[str, int] = defaultdict(int)
 
-    async def publish(self, task_id: str, event_type: str, data: dict[str, Any]) -> None:
+    async def publish(self, task_id: str, event_type: str, data: dict[str, Any], *, event_id: int | None = None) -> None:
         async with self._condition:
             events = self._events[task_id]
-            self._next_id[task_id] += 1
-            events.append({"id": self._next_id[task_id], "event": event_type, "data": data})
+            self._next_id[task_id] = max(self._next_id[task_id] + 1, event_id or 0)
+            events.append({"id": event_id or self._next_id[task_id], "event": event_type, "data": data})
             del events[:-500]
             self._condition.notify_all()
 

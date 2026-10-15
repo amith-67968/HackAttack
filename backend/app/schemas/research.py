@@ -24,6 +24,10 @@ class ResearchRequest(BaseModel):
     research_depth: Literal["standard", "deep"] = "standard"
     target_count: int | None = Field(default=None, ge=1, le=100)
     options: ResearchOptions = Field(default_factory=ResearchOptions)
+    failure_injection: Literal[
+        "search_once", "page_timeout", "after_source_persist", "lost_finding_response",
+        "restart_after_step", "exhaust_retries",
+    ] | None = None
 
     @field_validator("query")
     @classmethod
