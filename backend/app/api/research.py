@@ -21,6 +21,7 @@ from app.services.research_workflow import execute_research
 
 router = APIRouter(prefix="/research", tags=["research"])
 artifact_router = APIRouter(tags=["artifacts"])
+source_router = APIRouter(prefix="/sources", tags=["sources"])
 
 
 def get_repository(settings: Settings = Depends(get_settings)) -> SupabaseTaskRepository:
@@ -85,7 +86,11 @@ async def create_research(
         "output_type": body.output_type,
         "research_depth": body.research_depth,
         "status": "QUEUED",
-        "config": {"target_count": body.target_count, **body.options.model_dump(mode="json"), "failure_injection": body.failure_injection},
+        "config": {
+            "target_count": body.target_count, **body.options.model_dump(mode="json"),
+            "input_materials": [item.model_dump(mode="json") for item in body.input_materials],
+            "failure_injection": body.failure_injection,
+        },
     }
     try:
         await asyncio.to_thread(repository.create_task, row)
@@ -106,6 +111,22 @@ def _check_task_id(task_id: str) -> str:
         return str(UUID(task_id))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="task_id must be a UUID") from exc
+
+
+@router.get("")
+async def list_research(limit: int = Query(default=20, ge=1, le=50), repository: SupabaseTaskRepository = Depends(get_repository)):
+    try:
+        return {"tasks": await asyncio.to_thread(repository.list_tasks, limit)}
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail={"code": "supabase_read_failed", "message": str(exc)}) from exc
+
+
+@source_router.get("")
+async def list_recent_sources(limit: int = Query(default=50, ge=1, le=100), repository: SupabaseTaskRepository = Depends(get_repository)):
+    try:
+        return {"sources": await asyncio.to_thread(repository.list_recent_sources, limit)}
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail={"code": "supabase_read_failed", "message": str(exc)}) from exc
 
 
 async def _get_task_or_404(task_id: str, repository: SupabaseTaskRepository) -> dict:
@@ -179,6 +200,15 @@ async def get_findings(task_id: str, repository: SupabaseTaskRepository = Depend
     except PersistenceError as exc:
         raise HTTPException(status_code=503, detail={"code": "supabase_read_failed", "message": str(exc)}) from exc
     return {"findings": findings}
+
+
+@router.get("/{task_id}/steps")
+async def get_research_steps(task_id: str, repository: SupabaseTaskRepository = Depends(get_repository)):
+    task = await _get_task_or_404(task_id, repository)
+    try:
+        return {"steps": await asyncio.to_thread(repository.list_steps, task["id"])}
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail={"code": "supabase_read_failed", "message": str(exc)}) from exc
 
 
 def _artifact_public(row: dict) -> dict:
@@ -330,7 +360,11 @@ async def resume_research(
         query=task["query"], output_type=task.get("output_type", "auto"),
         research_depth=task.get("research_depth", "standard"),
         target_count=(task.get("config") or {}).get("target_count"),
-        options={key: (task.get("config") or {}).get(key) for key in ("location", "domain", "required_fields")},
+        options={
+            key: value for key in ("location", "domain", "required_fields", "reference_urls")
+            if (value := (task.get("config") or {}).get(key)) is not None
+        },
+        input_materials=(task.get("config") or {}).get("input_materials", []),
         failure_injection=(task.get("config") or {}).get("failure_injection"),
     )
     try:

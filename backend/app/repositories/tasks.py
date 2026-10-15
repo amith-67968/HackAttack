@@ -29,6 +29,8 @@ class TaskRepository(Protocol):
     def finalize_pending_cancellations(self) -> int: ...
     def get_task(self, task_id: str) -> dict[str, Any] | None: ...
     def list_sources(self, task_id: str) -> list[dict[str, Any]]: ...
+    def list_recent_sources(self, limit: int = 50) -> list[dict[str, Any]]: ...
+    def list_tasks(self, limit: int = 20) -> list[dict[str, Any]]: ...
     def list_findings(self, task_id: str) -> list[dict[str, Any]]: ...
     def list_steps(self, task_id: str) -> list[dict[str, Any]]: ...
     def list_events(self, task_id: str, after: int = 0, limit: int = 100) -> list[dict[str, Any]]: ...
@@ -45,7 +47,8 @@ class SupabaseTaskRepository:
     _READ_OPERATIONS = frozenset({
         "task lookup", "step lookup", "step listing", "attempt listing",
         "source lookup", "source listing", "finding listing", "event listing",
-        "artifact listing", "artifact lookup",
+        "artifact listing", "artifact lookup", "task listing",
+        "recent source listing",
     })
 
     def __init__(self, url: str, service_role_key: str, *, client: Client | None = None) -> None:
@@ -205,8 +208,24 @@ class SupabaseTaskRepository:
         data = self._execute("task lookup", self._client.table("research_tasks").select("*").eq("id", task_id).limit(1))
         return data[0] if data else None
 
+    def list_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
+        return self._execute(
+            "task listing",
+            self._client.table("research_tasks").select(
+                "id,query,status,summary,error_summary,created_at,updated_at,completed_at,started_at"
+            ).order("created_at", desc=True).limit(min(max(limit, 1), 50)),
+        )
+
     def list_sources(self, task_id: str) -> list[dict[str, Any]]:
         return self._execute("source listing", self._client.table("sources").select("*").eq("task_id", task_id).order("created_at"))
+
+    def list_recent_sources(self, limit: int = 50) -> list[dict[str, Any]]:
+        return self._execute(
+            "recent source listing",
+            self._client.table("sources").select(
+                "id,task_id,url,canonical_url,title,domain,source_type,retrieved_at,fetch_status,created_at,quality_notes"
+            ).order("created_at", desc=True).limit(min(max(limit, 1), 100)),
+        )
 
     def list_findings(self, task_id: str) -> list[dict[str, Any]]:
         return self._execute("finding listing", self._client.table("findings").select("*").eq("task_id", task_id).order("created_at"))

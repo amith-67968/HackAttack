@@ -6,6 +6,9 @@ export async function getHealth() {
   return response.json()
 }
 
+export function getRecentResearch(limit = 20) { return request(`/api/research?limit=${encodeURIComponent(limit)}`) }
+export function getRecentSources(limit = 50) { return request(`/api/sources?limit=${encodeURIComponent(limit)}`) }
+
 async function request(path, options = {}) {
   const response = await fetch(`${API_BASE_URL}${path}`, options)
   const payload = await response.json().catch(() => ({}))
@@ -25,6 +28,7 @@ export function createResearch(input) {
 export function getResearch(taskId) { return request(`/api/research/${taskId}`) }
 export function getResearchSources(taskId) { return request(`/api/research/${taskId}/sources`) }
 export function getResearchFindings(taskId) { return request(`/api/research/${taskId}/findings`) }
+export function getResearchSteps(taskId) { return request(`/api/research/${taskId}/steps`) }
 export function getResearchArtifacts(taskId) { return request(`/api/research/${taskId}/artifacts`) }
 export function createResearchArtifact(taskId, input) {
   return request(`/api/research/${taskId}/artifacts`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) })

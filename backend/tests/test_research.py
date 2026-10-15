@@ -94,6 +94,22 @@ def test_request_rejects_unknown_properties():
         ResearchRequest(query="Find clinics", arbitrary_tool="unsafe")
 
 
+def test_request_validates_reference_urls_and_text_materials():
+    request = ResearchRequest(
+        query="Summarize the supplied information",
+        options={"reference_urls": ["https://example.org/guide"]},
+        input_materials=[{"filename": "notes.md", "content": "A short source note."}],
+    )
+    assert request.options.reference_urls == ["https://example.org/guide"]
+    assert request.input_materials[0].filename == "notes.md"
+    with pytest.raises(ValidationError, match="HTTP or HTTPS"):
+        ResearchRequest(query="Summarize the supplied information", options={"reference_urls": ["file:///private"]})
+    with pytest.raises(ValidationError, match="Only plain text and Markdown"):
+        ResearchRequest(query="Summarize the supplied information", input_materials=[{"filename": "notes.pdf", "content": "not parsed"}])
+    with pytest.raises(ValidationError, match="50 KB"):
+        ResearchRequest(query="Summarize the supplied information", input_materials=[{"filename": "large.txt", "content": "x" * 50_001}])
+
+
 def test_url_canonicalization_drops_tracking_and_rejects_non_http():
     assert normalize_url("HTTPS://Example.Org/path/?utm_source=search&ref=site#top") == "https://example.org/path?ref=site"
     with pytest.raises(ValueError):
@@ -531,6 +547,12 @@ class MemoryRepository:
     def list_sources(self, task_id):
         return [row for row in self.sources.values() if row["task_id"] == task_id]
 
+    def list_tasks(self, limit=20):
+        return sorted(self.tasks.values(), key=lambda row: row.get("created_at", ""), reverse=True)[:limit]
+
+    def list_recent_sources(self, limit=50):
+        return list(self.sources.values())[:limit]
+
     def list_findings(self, task_id):
         return [row for row in self.findings.values() if row["task_id"] == task_id]
 
@@ -587,6 +609,48 @@ async def test_workflow_searches_reads_extracts_and_streams_mocked_evidence(monk
     assert "finding_extracted" in event_types
     assert "rate_limited" in repository.tasks[task_id]["error_summary"]
     assert event_types[-1] == "task_completed"
+
+
+@pytest.mark.asyncio
+async def test_workflow_persists_user_urls_and_uploads_as_research_sources(monkeypatch):
+    request = ResearchRequest(
+        query="Find clinic name and consultation price",
+        options={"required_fields": ["name", "price"], "reference_urls": ["https://example.org/reference"]},
+        input_materials=[{"filename": "clinic-notes.md", "content": "Alpha Clinic consultation price: $40."}],
+    )
+    settings = Settings(_env_file=None, tavily_api_key="test", firecrawl_api_key="test", max_task_duration_seconds=15, max_provider_attempts=1)
+    repository = MemoryRepository()
+    task_id = str(uuid4())
+    repository.create_task({"id": task_id, "query": request.query, "status": "QUEUED"})
+
+    async def fake_plan(_settings, _request): return valid_plan()
+
+    class NoResultsSearch:
+        def __init__(self, *_args): pass
+        async def search(self, *_args, **_kwargs): return []
+
+    class FakeScraper:
+        def __init__(self, *_args): pass
+        async def scrape(self, _url): return {"markdown": "Alpha Clinic offers consultations.", "metadata": {"title": "Clinic page"}}
+
+    async def empty_extraction(*_args, **kwargs):
+        return ExtractionResult(findings=[])
+
+    monkeypatch.setattr(research_workflow, "create_plan", fake_plan)
+    monkeypatch.setattr(research_workflow, "TavilySearch", NoResultsSearch)
+    monkeypatch.setattr(research_workflow, "FirecrawlScraper", FakeScraper)
+    monkeypatch.setattr(research_workflow, "extract_fields", empty_extraction)
+    monkeypatch.setattr(research_workflow, "is_public_url", lambda _url: asyncio.sleep(0, result=True))
+
+    await research_workflow.execute_research(task_id, request, settings, repository, ProgressHub())
+
+    uploaded = next(row for row in repository.sources.values() if row["source_type"] == "user_upload")
+    reference = next(row for row in repository.sources.values() if row["source_type"] == "user_reference")
+    assert uploaded["title"] == "clinic-notes.md"
+    assert uploaded["page_content"] == "Alpha Clinic consultation price: $40."
+    assert uploaded["fetch_status"] == "retrieved"
+    assert reference["canonical_url"] == "https://example.org/reference"
+    assert reference["fetch_status"] == "retrieved"
 
 
 def test_supabase_repository_crud_uses_expected_tables_and_upsert_keys():
@@ -648,6 +712,22 @@ def test_supabase_repository_crud_uses_expected_tables_and_upsert_keys():
     assert len(repository.list_findings(task_id)) == 1
     assert client.tables["research_steps"][0]["status"] == "SUCCEEDED"
     assert repository.get_task(task_id)["status"] == "RUNNING"
+
+
+def test_recent_tasks_sources_and_saved_steps_api_use_repository_data():
+    repository = MemoryRepository()
+    task_id = str(uuid4())
+    repository.create_task({"id": task_id, "query": "Saved research question", "status": "COMPLETED", "created_at": "2026-10-15T00:00:00Z"})
+    repository.create_step({"task_id": task_id, "action_key": "plan", "sequence_no": 1, "title": "Plan", "status": "VERIFIED"})
+    repository.upsert_source({"task_id": task_id, "url": "https://example.org", "canonical_url": "https://example.org", "source_type": "user_reference", "fetch_status": "retrieved"})
+    app.dependency_overrides[research_api.get_repository] = lambda: repository
+    try:
+        client = TestClient(app)
+        assert client.get("/api/research").json()["tasks"][0]["query"] == "Saved research question"
+        assert client.get("/api/sources").json()["sources"][0]["url"] == "https://example.org"
+        assert client.get(f"/api/research/{task_id}/steps").json()["steps"][0]["action_key"] == "plan"
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_supabase_pgrst205_includes_safe_schema_remediation():

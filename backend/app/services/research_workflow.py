@@ -334,6 +334,58 @@ async def execute_research(
                     await emit("worker_interrupted", {"step_id": action.action_id, "message": "Development restart point reached; resume to continue."})
                     raise WorkerInterrupted()
 
+            # Explicit reference URLs are user-directed candidates, still subject
+            # to the same public-address validation as discovered URLs.
+            for raw_url in request.options.reference_urls:
+                if len(candidates) >= settings.max_pages_per_task:
+                    warnings.append("The per-task page limit was reached before all reference URLs could be added.")
+                    break
+                try:
+                    canonical = normalize_url(raw_url)
+                except ValueError:
+                    warnings.append("A reference URL was skipped because it was not a valid public HTTP(S) URL.")
+                    continue
+                if canonical in candidates:
+                    continue
+                if not await is_public_url(canonical):
+                    warnings.append("A reference URL was skipped because it did not resolve to a public network address.")
+                    continue
+                parsed = urlsplit(canonical)
+                source = await _persist(repository, "upsert_source", {
+                    "task_id": task_id, "url": raw_url, "canonical_url": canonical,
+                    "title": None, "domain": parsed.hostname or "", "source_type": "user_reference",
+                    "retrieved_at": None, "content_excerpt": None,
+                    "quality_notes": "Reference URL supplied by the user.", "fetch_status": "discovered",
+                })
+                candidate = {"id": str(source["id"]), "url": raw_url, "canonical_url": canonical,
+                             "title": source.get("title"), "query": "User-provided reference URL"}
+                candidates[canonical] = candidate
+                await emit("source_discovered", {"source_id": candidate["id"], "url": raw_url,
+                                                   "title": candidate["title"], "source_type": "user_reference"})
+
+            # Text/Markdown materials are persisted as source rows so extraction,
+            # evidence excerpts and restart recovery use the same durable path.
+            for material in request.input_materials:
+                if len(candidates) >= settings.max_pages_per_task:
+                    warnings.append("The per-task page limit was reached before all uploaded materials could be added.")
+                    break
+                digest = hashlib.sha256((material.filename + "\0" + material.content).encode("utf-8")).hexdigest()
+                canonical = f"upload://{digest}"
+                if canonical in candidates:
+                    continue
+                source = await _persist(repository, "upsert_source", {
+                    "task_id": task_id, "url": canonical, "canonical_url": canonical,
+                    "title": material.filename, "domain": "user-upload", "source_type": "user_upload",
+                    "retrieved_at": utc_now(), "content_excerpt": material.content[:1200],
+                    "page_content": material.content, "quality_notes": "Text supplied by the user; not independently verified.",
+                    "fetch_status": "retrieved",
+                })
+                candidate = {"id": str(source["id"]), "url": canonical, "canonical_url": canonical,
+                             "title": material.filename, "query": "User-uploaded text material"}
+                candidates[canonical] = candidate
+                await emit("source_discovered", {"source_id": candidate["id"], "url": None,
+                                                   "title": material.filename, "source_type": "user_upload"})
+
             # Existing sources are reconciled from Supabase, including a save whose
             # response was lost before an event or step result could be recorded.
             for source in await _persist(repository, "list_sources", task_id):
@@ -368,7 +420,8 @@ async def execute_research(
                     # Tasks can wait here while cancellation is requested.
                     await check_cancelled()
                     await emit("step_started", {"step_id": key, "action_type": "fetch_and_extract", "source_id": source["id"], "title": source["title"] or source["canonical_url"]})
-                    if not await is_public_url(source["canonical_url"]):
+                    is_user_upload = source.get("source_type") == "user_upload"
+                    if not is_user_upload and not await is_public_url(source["canonical_url"]):
                         message = "URL was rejected because it was not a verified public HTTP(S) destination"
                         warnings.append(message)
                         await _persist(repository, "update_source", source["id"], {"fetch_status": "blocked_url", "quality_notes": message})
@@ -380,7 +433,7 @@ async def execute_research(
                     if source_state.get("page_content"):
                         # Page retrieval was durably acknowledged before a crash; reuse it.
                         content = source_state["page_content"]
-                    if content is None:
+                    if content is None and not is_user_upload:
                         async def retrieve():
                             return await injected_call("firecrawl_scrape", lambda: scraper.scrape(source["canonical_url"]))
                         try:
@@ -409,6 +462,8 @@ async def execute_research(
                             "page_content": content,
                             "fetch_status": "retrieved",
                         })
+                        sources_read += 1
+                    elif is_user_upload and content is not None:
                         sources_read += 1
 
                     saved_findings = await _persist(repository, "list_findings", task_id)
