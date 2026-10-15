@@ -1,0 +1,20 @@
+# Local configuration and secrets
+.env
+**/.env
+!.env.example
+**/!.env.example
+
+# JavaScript
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local generated artifacts
+artifacts/
