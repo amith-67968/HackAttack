@@ -4,7 +4,10 @@ import httpx
 
 
 class TavilyError(RuntimeError):
-    pass
+    def __init__(self, message: str, status_code: int | None = None, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 class TavilySearch:
@@ -37,4 +40,10 @@ class TavilySearch:
         except (httpx.HTTPError, ValueError) as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             category = "rate limited" if status == 429 else "request failed"
-            raise TavilyError(f"Tavily search {category}: {status or exc.__class__.__name__}") from exc
+            headers = getattr(getattr(exc, "response", None), "headers", {})
+            retry_after = headers.get("Retry-After")
+            try:
+                retry_after = float(retry_after) if retry_after is not None else None
+            except ValueError:
+                retry_after = None
+            raise TavilyError(f"Tavily search {category}: {status or exc.__class__.__name__}", status, retry_after) from exc
