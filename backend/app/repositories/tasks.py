@@ -22,6 +22,9 @@ class TaskRepository(Protocol):
     def get_task(self, task_id: str) -> dict[str, Any] | None: ...
     def list_sources(self, task_id: str) -> list[dict[str, Any]]: ...
     def list_findings(self, task_id: str) -> list[dict[str, Any]]: ...
+    def list_steps(self, task_id: str) -> list[dict[str, Any]]: ...
+    def list_events(self, task_id: str, after: int = 0, limit: int = 100) -> list[dict[str, Any]]: ...
+    def append_event(self, task_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]: ...
 
 
 class SupabaseTaskRepository:
@@ -70,6 +73,27 @@ class SupabaseTaskRepository:
             self._client.table("research_steps").update(row).eq("task_id", task_id).eq("action_key", action_key),
         )
 
+    def get_step(self, task_id: str, action_key: str) -> dict[str, Any] | None:
+        data = self._execute(
+            "step lookup", self._client.table("research_steps").select("*").eq("task_id", task_id).eq("action_key", action_key).limit(1)
+        )
+        return data[0] if data else None
+
+    def list_steps(self, task_id: str) -> list[dict[str, Any]]:
+        return self._execute("step listing", self._client.table("research_steps").select("*").eq("task_id", task_id).order("sequence_no"))
+
+    def create_attempt(self, row: dict[str, Any]) -> dict[str, Any]:
+        data = self._execute("attempt creation", self._client.table("research_step_attempts").insert(row))
+        if not data:
+            raise PersistenceError("Supabase attempt creation returned no attempt row")
+        return data[0]
+
+    def update_attempt(self, attempt_id: str, row: dict[str, Any]) -> None:
+        self._execute("attempt update", self._client.table("research_step_attempts").update(row).eq("id", attempt_id))
+
+    def list_attempts(self, task_id: str) -> list[dict[str, Any]]:
+        return self._execute("attempt listing", self._client.table("research_step_attempts").select("*").eq("task_id", task_id).order("started_at"))
+
     def upsert_source(self, row: dict[str, Any]) -> dict[str, Any]:
         data = self._execute(
             "source save",
@@ -108,3 +132,54 @@ class SupabaseTaskRepository:
 
     def list_findings(self, task_id: str) -> list[dict[str, Any]]:
         return self._execute("finding listing", self._client.table("findings").select("*").eq("task_id", task_id).order("created_at"))
+
+    def append_event(self, task_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            response = self._client.rpc("append_research_task_event", {
+                "p_task_id": task_id, "p_event_type": event_type, "p_payload": payload,
+            }).execute()
+            rows = response.data or []
+            if isinstance(rows, dict):
+                return {**rows, "event_type": event_type, "payload": payload}
+            if rows:
+                return {**rows[0], "event_type": event_type, "payload": payload}
+            raise PersistenceError("Supabase event append returned no sequence")
+        except PersistenceError:
+            raise
+        except Exception as exc:
+            raise PersistenceError(f"Supabase event append failed ({exc.__class__.__name__})") from exc
+
+    def list_events(self, task_id: str, after: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+        return self._execute(
+            "event listing", self._client.table("research_task_events").select("*").eq("task_id", task_id)
+            .gt("sequence_no", after).order("sequence_no").limit(min(max(limit, 1), 500))
+        )
+
+    def claim_task(self, task_id: str, worker_id: str, *, resume: bool) -> bool:
+        try:
+            response = self._client.rpc("claim_research_task", {
+                "p_task_id": task_id, "p_worker_id": worker_id, "p_resume": resume,
+            }).execute()
+            return bool(response.data)
+        except Exception as exc:
+            raise PersistenceError(f"Supabase task claim failed ({exc.__class__.__name__})") from exc
+
+    def heartbeat(self, task_id: str, worker_id: str) -> bool:
+        try:
+            return bool(self._client.rpc("heartbeat_research_task", {
+                "p_task_id": task_id, "p_worker_id": worker_id,
+            }).execute().data)
+        except Exception as exc:
+            raise PersistenceError(f"Supabase worker heartbeat failed ({exc.__class__.__name__})") from exc
+
+    def release_task(self, task_id: str, worker_id: str) -> None:
+        try:
+            self._client.rpc("release_research_task", {"p_task_id": task_id, "p_worker_id": worker_id}).execute()
+        except Exception as exc:
+            raise PersistenceError(f"Supabase worker release failed ({exc.__class__.__name__})") from exc
+
+    def request_cancel(self, task_id: str) -> bool:
+        try:
+            return bool(self._client.rpc("request_research_cancellation", {"p_task_id": task_id}).execute().data)
+        except Exception as exc:
+            raise PersistenceError(f"Supabase cancellation request failed ({exc.__class__.__name__})") from exc
