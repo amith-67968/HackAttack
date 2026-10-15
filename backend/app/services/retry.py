@@ -1,6 +1,7 @@
 """Bounded retry classification for transient provider failures."""
 
 import random
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -68,3 +69,44 @@ def retry_delay(attempt_no: int, *, base_seconds: float, max_seconds: float, jit
     """Exponential backoff with bounded jitter; attempt_no is the failed attempt."""
     ceiling = min(max_seconds, base_seconds * (2 ** max(0, attempt_no - 1)))
     return min(max_seconds, max(0.0, float(jitter(ceiling * 0.8, ceiling * 1.2))))
+
+
+def safe_error_text(exc: BaseException, classification: ErrorClassification) -> str:
+    status = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if status is None and response is not None:
+        status = getattr(response, "status_code", None)
+    return f"{classification.name} (HTTP {status})" if status is not None else f"{classification.name} provider failure"
+
+
+async def run_with_retries(
+    operation: Any,
+    *,
+    max_attempts: int,
+    base_seconds: float,
+    max_seconds: float,
+    on_start: Any,
+    on_attempt: Any,
+    on_retry: Any,
+    sleep: Any = asyncio.sleep,
+    jitter: Any = random.uniform,
+) -> Any:
+    """Run one action with bounded retries; callbacks persist attempt outcomes."""
+    for attempt_no in range(1, max_attempts + 1):
+        await on_start(attempt_no)
+        try:
+            result = await operation()
+        except Exception as exc:
+            classification = classify_error(exc)
+            await on_attempt(attempt_no, False, classification, safe_error_text(exc, classification))
+            if not classification.retryable or attempt_no >= max_attempts:
+                raise
+            delay = classification.retry_after_seconds
+            if delay is None:
+                delay = retry_delay(attempt_no, base_seconds=base_seconds, max_seconds=max_seconds, jitter=jitter)
+            await on_retry(attempt_no, classification, delay)
+            await sleep(delay)
+        else:
+            await on_attempt(attempt_no, True, None, None)
+            return result
+    raise RuntimeError("Retry loop exhausted without a result")
