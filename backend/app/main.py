@@ -1,4 +1,7 @@
 import ipaddress
+import asyncio
+import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -7,9 +10,28 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.health import router as health_router
 from app.api.research import router as research_router
 from app.core.config import get_settings
+from app.repositories.tasks import SupabaseTaskRepository
 
 settings = get_settings()
-app = FastAPI(title="ProofLoop API", version="0.1.0")
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # A restart must finalize abandoned cancellation requests before any task
+    # can be resumed. Never auto-resume research work at startup.
+    if settings.app_env != "test" and settings.supabase_configured:
+        try:
+            repository = SupabaseTaskRepository(settings.supabase_url, settings.supabase_service_role_key)
+            recovered = await asyncio.to_thread(repository.finalize_pending_cancellations)
+            if recovered:
+                logger.info("Finalized %d pending research cancellation(s) after startup", recovered)
+        except Exception as exc:
+            logger.error("Could not finalize pending research cancellations at startup (%s)", exc.__class__.__name__)
+    yield
+
+
+app = FastAPI(title="ProofLoop API", version="0.1.0", lifespan=lifespan)
 
 
 @app.middleware("http")

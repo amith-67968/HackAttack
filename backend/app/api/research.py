@@ -30,6 +30,19 @@ def get_repository(settings: Settings = Depends(get_settings)) -> SupabaseTaskRe
         raise HTTPException(status_code=503, detail={"code": "supabase_client_error", "message": f"Could not initialize Supabase ({exc.__class__.__name__})."}) from exc
 
 
+def _has_active_worker(task: dict) -> bool:
+    if not task.get("worker_id"):
+        return False
+    lease_value = task.get("lease_expires_at")
+    try:
+        lease_expiry = datetime.fromisoformat(lease_value.replace("Z", "+00:00")) if isinstance(lease_value, str) else lease_value
+        if lease_expiry and lease_expiry.tzinfo is None:
+            lease_expiry = lease_expiry.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return False
+    return bool(lease_expiry and lease_expiry > datetime.now(timezone.utc))
+
+
 async def require_research_providers(settings: Settings = Depends(get_settings)) -> Settings:
     missing = []
     if not settings.supabase_url or not settings.supabase_service_role_key:
@@ -172,6 +185,13 @@ async def resume_research(
 ):
     task = await _get_task_or_404(task_id, repository)
     task_id = task["id"]
+    if task.get("cancel_requested") or task.get("status") == "CANCELLED":
+        if task.get("status") != "CANCELLED" and not task.get("worker_id"):
+            try:
+                await asyncio.to_thread(repository.finalize_pending_cancellations)
+            except PersistenceError as exc:
+                raise HTTPException(status_code=503, detail={"code": "cancellation_recovery_failed", "message": str(exc)}) from exc
+        raise HTTPException(status_code=409, detail={"code": "task_cancelled", "message": "Cancellation is pending or complete; this task will not be resumed."})
     if task.get("status") in {"COMPLETED", "CANCELLED"}:
         raise HTTPException(status_code=409, detail={"code": "task_not_resumable", "message": f"A {task.get('status')} task cannot be resumed."})
     if task.get("status") not in {"QUEUED", "PLANNING", "FAILED", "COMPLETED_WITH_LIMITATIONS", "RUNNING", "RECOVERING"}:
@@ -238,7 +258,19 @@ async def resume_research(
 @router.post("/{task_id}/cancel")
 async def cancel_research(task_id: str, repository: SupabaseTaskRepository = Depends(get_repository)):
     task = await _get_task_or_404(task_id, repository)
-    if task.get("status") in {"COMPLETED", "COMPLETED_WITH_LIMITATIONS", "FAILED", "CANCELLED"}:
+    if task.get("status") == "CANCELLED":
+        return {"task_id": task["id"], "status": "CANCELLED"}
+    if task.get("cancel_requested"):
+        if not _has_active_worker(task):
+            try:
+                await asyncio.to_thread(repository.finalize_pending_cancellations)
+            except PersistenceError as exc:
+                raise HTTPException(status_code=503, detail={"code": "cancel_failed", "message": str(exc)}) from exc
+            current = await _get_task_or_404(task["id"], repository)
+            if current.get("status") == "CANCELLED":
+                return {"task_id": task["id"], "status": "CANCELLED"}
+        return {"task_id": task["id"], "status": "CANCELLATION_REQUESTED"}
+    if task.get("status") in {"COMPLETED", "COMPLETED_WITH_LIMITATIONS", "FAILED"}:
         raise HTTPException(status_code=409, detail={"code": "task_not_cancellable", "message": f"A {task.get('status')} task cannot be cancelled."})
     try:
         requested = await asyncio.to_thread(repository.request_cancel, task["id"])
@@ -248,6 +280,15 @@ async def cancel_research(task_id: str, repository: SupabaseTaskRepository = Dep
         raise HTTPException(status_code=503, detail={"code": "cancel_failed", "message": str(exc)}) from exc
     if not requested:
         raise HTTPException(status_code=409, detail={"code": "task_not_cancellable", "message": "Cancellation was not accepted by the current task state."})
+    current = await _get_task_or_404(task["id"], repository)
+    if not _has_active_worker(current):
+        try:
+            await asyncio.to_thread(repository.finalize_pending_cancellations)
+        except PersistenceError as exc:
+            raise HTTPException(status_code=503, detail={"code": "cancel_failed", "message": str(exc)}) from exc
+        current = await _get_task_or_404(task["id"], repository)
+        if current.get("status") == "CANCELLED":
+            return {"task_id": task["id"], "status": "CANCELLED"}
     return {"task_id": task["id"], "status": "CANCELLATION_REQUESTED"}
 
 
