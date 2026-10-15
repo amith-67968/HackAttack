@@ -6,17 +6,26 @@ from typing import Any, AsyncIterator
 class ProgressHub:
     """In-process progress fanout with short-lived replay for late SSE subscribers."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_tasks: int = 1000, max_events_per_task: int = 500) -> None:
         self._condition = asyncio.Condition()
         self._events: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._next_id: dict[str, int] = defaultdict(int)
+        self._max_tasks = max_tasks
+        self._max_events_per_task = max_events_per_task
 
     async def publish(self, task_id: str, event_type: str, data: dict[str, Any], *, event_id: int | None = None) -> None:
         async with self._condition:
             events = self._events[task_id]
-            self._next_id[task_id] = max(self._next_id[task_id] + 1, event_id or 0)
-            events.append({"id": event_id or self._next_id[task_id], "event": event_type, "data": data})
-            del events[:-500]
+            next_id = max(self._next_id[task_id] + 1, event_id or 0)
+            self._next_id[task_id] = next_id
+            events.append({"id": next_id, "event": event_type, "data": data})
+            del events[:-self._max_events_per_task]
+            while len(self._events) > self._max_tasks:
+                expired = next(iter(self._events))
+                if expired == task_id and len(self._events) == 1:
+                    break
+                self._events.pop(expired, None)
+                self._next_id.pop(expired, None)
             self._condition.notify_all()
 
     def history(self, task_id: str) -> list[dict[str, Any]]:

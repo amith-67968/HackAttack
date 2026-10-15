@@ -19,11 +19,19 @@ class ErrorClassification:
 
 def _retry_after(exc: BaseException) -> float | None:
     value = getattr(exc, "retry_after_seconds", None)
+    if value is None and exc.__cause__ is not None and exc.__cause__ is not exc:
+        value = _retry_after(exc.__cause__)
     if value is not None:
         try:
             return max(0.0, float(value))
         except (TypeError, ValueError):
-            return None
+            try:
+                when = parsedate_to_datetime(str(value))
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                return None
     response = getattr(exc, "response", None)
     header = getattr(response, "headers", {}).get("Retry-After") if response is not None else None
     if not header:
@@ -62,6 +70,11 @@ def classify_error(exc: BaseException) -> ErrorClassification:
         return ErrorClassification("validation", False)
     if isinstance(exc, (ValueError, TypeError)):
         return ErrorClassification("validation", False)
+    cause = exc.__cause__
+    if cause is not None and cause is not exc:
+        nested = classify_error(cause)
+        if nested.retryable:
+            return ErrorClassification(nested.name, True, retry_after or nested.retry_after_seconds)
     return ErrorClassification("unknown", False)
 
 

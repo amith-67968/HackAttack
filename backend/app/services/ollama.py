@@ -40,7 +40,10 @@ async def check_ollama(settings: Settings) -> dict[str, Any]:
 
 
 class OllamaError(RuntimeError):
-    pass
+    def __init__(self, message: str, status_code: int | None = None, retry_after_seconds: float | str | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 async def generate_structured(
@@ -76,4 +79,6 @@ async def generate_structured(
     except (httpx.HTTPError, ValueError, TypeError) as exc:
         status = getattr(getattr(exc, "response", None), "status_code", None)
         reason = "model not found" if status == 404 else "request or response validation failed"
-        raise OllamaError(f"Ollama {reason}: {status or exc.__class__.__name__}") from exc
+        response = getattr(exc, "response", None)
+        retry_after = getattr(response, "headers", {}).get("Retry-After") if response is not None else None
+        raise OllamaError(f"Ollama {reason}: {status or exc.__class__.__name__}", status, retry_after) from exc

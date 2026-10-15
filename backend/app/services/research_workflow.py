@@ -108,7 +108,7 @@ async def execute_research(
             current = await _persist(repository, "get_task", task_id)
             if current and (current.get("cancel_requested") or current.get("status") == "CANCELLED"):
                 raise CancellationObserved()
-            if hasattr(repository, "heartbeat") and not await _persist(repository, "heartbeat", task_id, worker_id):
+            if current and current.get("worker_id") == worker_id and hasattr(repository, "heartbeat") and not await _persist(repository, "heartbeat", task_id, worker_id):
                 raise CancellationObserved()
 
         async def get_step(key: str) -> dict[str, Any] | None:
@@ -278,6 +278,9 @@ async def execute_research(
                         await emit("source_discovered", {"source_id": source_id, "url": raw_url, "title": candidate["title"], "query": action.query})
                         if failure_point == "after_source_persist" and "after_source_persist" not in used_injections:
                             used_injections.add("after_source_persist")
+                            # Drop volatile knowledge to model a lost acknowledgment; resume
+                            # must rediscover the row via its durable canonical URL.
+                            candidates.pop(canonical, None)
                             raise httpx.ReadTimeout("Injected lost response after source save")
                     return discovered
 
@@ -324,6 +327,9 @@ async def execute_research(
                 })
                 if _done(step):
                     return
+                if step and step.get("status") == "FAILED" and step.get("last_error_classification") in {"authorization", "validation"}:
+                    warnings.append(step.get("last_error") or "A permanent retrieval or extraction error requires correction.")
+                    return
                 source_state = next((item for item in await _persist(repository, "list_sources", task_id) if item["id"] == source["id"]), source)
                 async with semaphore:
                     await emit("step_started", {"step_id": key, "action_type": "fetch_and_extract", "source_id": source["id"], "title": source["title"] or source["canonical_url"]})
@@ -369,8 +375,11 @@ async def execute_research(
 
                     saved_findings = await _persist(repository, "list_findings", task_id)
                     existing_source_findings = [item for item in saved_findings if item.get("source_id") == source["id"]]
-                    covered = {_key(item["field_name"]) for item in existing_source_findings}
-                    if {_key(field) for field in plan.required_fields}.issubset(covered):
+                    covered_fields: dict[str, set[str]] = {}
+                    for finding in existing_source_findings:
+                        covered_fields.setdefault(finding.get("entity_key", _key(finding.get("entity_name", ""))), set()).add(_key(finding["field_name"]))
+                    covered = {_key(field) for field in plan.required_fields}
+                    if any(covered.issubset(fields) for fields in covered_fields.values()):
                         # Reconcile a crash after the unique upsert but before step completion.
                         await _persist(repository, "update_step", task_id, key, {
                             "status": "VERIFIED", "result": {"finding_count": len(existing_source_findings), "source_id": source["id"]},
@@ -388,7 +397,15 @@ async def execute_research(
                             "verification_status": "source_supported" if item.value_status == "found" else "missing_or_uncertain",
                             "confidence_notes": "Source-backed extraction only; independent cross-checking is not part of this stage.",
                         } for item in extraction.findings]
-                        await _persist(repository, "upsert_findings", rows)
+                        # Merge only missing fields for the matching entity; unique keys
+                        # make this safe if the response is lost after the database write.
+                        missing_rows = []
+                        for row in rows:
+                            entity_fields = covered_fields.get(row["entity_key"], set())
+                            if _key(row["field_name"]) not in entity_fields:
+                                missing_rows.append(row)
+                        if missing_rows:
+                            await _persist(repository, "upsert_findings", missing_rows)
                         if failure_point == "lost_finding_response" and "lost_finding_response" not in used_injections:
                             used_injections.add("lost_finding_response")
                             raise httpx.ReadTimeout("Injected lost response after finding save")
@@ -433,19 +450,31 @@ async def execute_research(
             status = "FAILED" if not sources_read and not findings_saved and not await _persist(repository, "list_findings", task_id) and failed else (
                 "COMPLETED_WITH_LIMITATIONS" if warnings or failed or unresolved else "COMPLETED"
             )
-            summary = f"Read {sources_read} source(s) and saved {findings_saved} source-backed field(s). Extracted values have not been independently cross-checked."
+            durable_sources = await _persist(repository, "list_sources", task_id)
+            durable_findings = await _persist(repository, "list_findings", task_id)
+            completed_sources = sum(1 for source in durable_sources if source.get("fetch_status") == "retrieved")
+            summary = f"Read {completed_sources} source(s) and saved {len(durable_findings)} source-backed field(s). Extracted values have not been independently cross-checked."
             if status == "COMPLETED_WITH_LIMITATIONS":
                 summary += f" {len(set(warnings))} issue(s) limited coverage."
+            from app.services.transitions import validate_task_completion
+            validate_task_completion(status, [step.get("status", "PENDING") for step in all_steps])
             await _persist(repository, "update_task", task_id, {
                 "status": status, "summary": summary, "error_summary": "; ".join(dict.fromkeys(warnings))[:4000] or None,
                 "completed_at": utc_now(), "updated_at": utc_now(),
             })
-            await emit("task_completed", {"status": status, "summary": summary, "sources_read": sources_read,
-                                           "findings_saved": findings_saved, "limitations": list(dict.fromkeys(warnings))})
+            await emit("task_error" if status == "FAILED" else "task_completed", {
+                "status": status, "summary": summary, "sources_read": completed_sources,
+                "findings_saved": len(durable_findings), "limitations": list(dict.fromkeys(warnings)),
+            })
     except WorkerInterrupted:
-        await emit_safely("worker_interrupted", {"status": "RUNNING", "message": "Worker stopped at a development recovery point."})
         if hasattr(repository, "release_task"):
-            await _persist(repository, "release_task", task_id, worker_id)
+            try:
+                await _persist(repository, "release_task", task_id, worker_id)
+            except Exception:
+                pass
+        # Publish only after releasing the durable lease so a client that reacts
+        # immediately to this event can successfully claim the recovery worker.
+        await emit_safely("worker_interrupted", {"status": "RUNNING", "message": "Worker stopped at a development recovery point."})
     except CancellationObserved:
         await _persist(repository, "update_task", task_id, {"status": "CANCELLED", "completed_at": utc_now(), "updated_at": utc_now()})
         await emit_safely("task_status", {"status": "CANCELLED", "message": "Cancellation observed; no additional steps will start."})
@@ -467,18 +496,19 @@ async def _cancel_requested(repository: Any, task_id: str) -> bool:
 
 
 async def _fail_task(task_id: str, message: str, repository: Any, hub: ProgressHub) -> None:
+    safe_message = message if message.startswith("Supabase ") else "Unexpected workflow failure; inspect the persisted step attempts for safe diagnostics."
     try:
         await _persist(repository, "update_task", task_id, {
-            "status": "FAILED", "error_summary": message, "completed_at": utc_now(), "updated_at": utc_now(),
+            "status": "FAILED", "error_summary": safe_message, "completed_at": utc_now(), "updated_at": utc_now(),
         })
     except Exception:
         pass
     try:
         if hasattr(repository, "append_event"):
-            event = await _persist(repository, "append_event", task_id, "task_error", {"task_id": task_id, "status": "FAILED", "message": message})
-            await hub.publish(task_id, "task_error", {"task_id": task_id, "status": "FAILED", "message": message}, event_id=event.get("sequence_no"))
+            event = await _persist(repository, "append_event", task_id, "task_error", {"task_id": task_id, "status": "FAILED", "message": safe_message})
+            await hub.publish(task_id, "task_error", {"task_id": task_id, "status": "FAILED", "message": safe_message}, event_id=event.get("sequence_no"))
         else:
-            await hub.publish(task_id, "task_error", {"task_id": task_id, "status": "FAILED", "message": message})
+            await hub.publish(task_id, "task_error", {"task_id": task_id, "status": "FAILED", "message": safe_message})
     except Exception:
         # Preserve the primary failure even when event persistence is unavailable.
         pass
