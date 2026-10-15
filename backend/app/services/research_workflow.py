@@ -12,8 +12,9 @@ from app.core.config import Settings
 from app.schemas.evidence import ExtractionResult
 from app.schemas.plan import ResearchPlan
 from app.schemas.research import ResearchRequest
-from app.services.extraction import extract_fields
+from app.services.extraction import extract_fields, finding_evidence_error
 from app.services.ollama import OllamaError
+from app.services.mcp_search import discover_and_search
 from app.services.planner import create_plan
 from app.services.progress import ProgressHub
 from app.services.retry import ErrorClassification, classify_error, run_with_retries, safe_error_text
@@ -26,7 +27,7 @@ class WorkerInterrupted(Exception):
     """Development-only simulated process loss; durable state is left resumable."""
 
 
-class CancellationObserved(Exception):
+class CancellationObserved(asyncio.CancelledError):
     pass
 
 
@@ -46,22 +47,27 @@ def _key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-") or "unknown"
 
 
-def _validate_extraction(result: ExtractionResult, required_fields: list[str], content: str) -> None:
+def _validate_extraction(result: ExtractionResult, required_fields: list[str], content: str, *, query: str = "", require_all: bool = True) -> None:
     expected = {_key(field) for field in required_fields}
-    found: set[str] = set()
+    found: set[tuple[str, str]] = set()
     for item in result.findings:
         name = _key(item.field_name)
         if name not in expected:
             raise ValueError(f"Extractor returned an unrequested field: {item.field_name}")
-        if name in found:
+        identity = (_key(item.entity_name), name)
+        if identity in found:
             raise ValueError(f"Extractor returned a duplicate field: {item.field_name}")
-        found.add(name)
-        if item.value_status == "found" and item.supporting_excerpt not in content:
-            raise ValueError("A supporting excerpt was not present verbatim in the source")
-        if item.value_status == "found" and item.field_value and item.field_value.casefold() not in item.supporting_excerpt.casefold():
-            raise ValueError("The extracted value was not present in its supporting excerpt")
-    missing = expected - found
-    if missing:
+        found.add(identity)
+        error = finding_evidence_error(
+            entity_name=item.entity_name, field_name=item.field_name,
+            field_value=item.field_value, value_status=item.value_status,
+            supporting_excerpt=item.supporting_excerpt, source_text=content,
+            query=query, required_fields=required_fields,
+        )
+        if error:
+            raise ValueError(error)
+    missing = expected - {field_name for _entity_name, field_name in found}
+    if require_all and missing:
         raise ValueError(f"Extractor omitted required fields: {', '.join(sorted(missing))}")
 
 
@@ -85,6 +91,7 @@ async def execute_research(
     sources_read = 0
     findings_saved = 0
     used_injections: set[str] = set()
+    cancellation_observed = asyncio.Event()
     try:
         task = await _persist(repository, "get_task", task_id) or {}
         config = task.get("config") or {}
@@ -105,10 +112,14 @@ async def execute_research(
                 pass
 
         async def check_cancelled() -> None:
+            if cancellation_observed.is_set():
+                raise CancellationObserved()
             current = await _persist(repository, "get_task", task_id)
             if current and (current.get("cancel_requested") or current.get("status") == "CANCELLED"):
+                cancellation_observed.set()
                 raise CancellationObserved()
             if current and current.get("worker_id") == worker_id and hasattr(repository, "heartbeat") and not await _persist(repository, "heartbeat", task_id, worker_id):
+                cancellation_observed.set()
                 raise CancellationObserved()
 
         async def get_step(key: str) -> dict[str, Any] | None:
@@ -130,17 +141,27 @@ async def execute_research(
             async def on_start(attempt_no: int) -> None:
                 await check_cancelled()
                 absolute_attempt = attempt_offset + attempt_no
-                next_status = "RUNNING"
-                await _persist(repository, "update_step", task_id, step["action_key"], {
-                    "status": next_status, "attempt_count": absolute_attempt,
-                    "started_at": utc_now(), "updated_at": utc_now(),
-                })
-                attempt = await _persist(repository, "create_attempt", {
-                    "task_id": task_id, "step_id": step_id, "attempt_no": absolute_attempt,
-                    "tool_name": tool, "status": "RUNNING", "started_at": utc_now(),
-                })
+                if hasattr(repository, "start_attempt"):
+                    attempt = await _persist(
+                        repository, "start_attempt", task_id, worker_id,
+                        step["action_key"], absolute_attempt, tool,
+                    )
+                    if not attempt:
+                        cancellation_observed.set()
+                        raise CancellationObserved()
+                else:
+                    await _persist(repository, "update_step", task_id, step["action_key"], {
+                        "status": "RUNNING", "attempt_count": absolute_attempt,
+                        "started_at": utc_now(), "updated_at": utc_now(),
+                    })
+                    attempt = await _persist(repository, "create_attempt", {
+                        "task_id": task_id, "step_id": step_id, "attempt_no": absolute_attempt,
+                        "tool_name": tool, "status": "RUNNING", "started_at": utc_now(),
+                    })
                 active_attempt["id"] = attempt.get("id")
                 await emit("tool_call_started", {"step_id": step["action_key"], "tool": tool, "attempt": absolute_attempt})
+                if tool.startswith("mcp_"):
+                    await emit("mcp_tool_invocation", {"step_id": step["action_key"], "tool_name": tool.removeprefix("mcp_"), "protocol": "MCP", "status": "started", "attempt": absolute_attempt})
 
             async def on_attempt(attempt_no: int, succeeded: bool, classification: ErrorClassification | None, safe_error: str | None) -> None:
                 attempt_id = active_attempt.get("id")
@@ -171,8 +192,16 @@ async def execute_research(
                     "error_classification": classification.name, "delay_seconds": delay,
                 })
 
+            async def guarded_operation():
+                await check_cancelled()
+                result = await operation()
+                # Providers cannot always be interrupted once sent; never commit
+                # their late result after cancellation has crossed its DB boundary.
+                await check_cancelled()
+                return result
+
             return await run_with_retries(
-                operation,
+                guarded_operation,
                 max_attempts=settings.max_provider_attempts,
                 base_seconds=settings.retry_base_delay_seconds,
                 max_seconds=settings.retry_max_delay_seconds,
@@ -182,9 +211,9 @@ async def execute_research(
             )
 
         async def injected_call(tool: str, operation: Any) -> Any:
-            if failure_point == "exhaust_retries" and tool == "tavily_search":
+            if failure_point == "exhaust_retries" and tool in {"tavily_search", "mcp_tavily_search"}:
                 raise httpx.ConnectError("Injected transient connection failure")
-            if failure_point == "search_once" and tool == "tavily_search" and "search_once" not in used_injections:
+            if failure_point == "search_once" and tool in {"tavily_search", "mcp_tavily_search"} and "search_once" not in used_injections:
                 used_injections.add("search_once")
                 raise httpx.ConnectError("Injected transient connection failure")
             if failure_point == "page_timeout" and tool == "firecrawl_scrape":
@@ -245,11 +274,13 @@ async def execute_research(
                     continue
 
                 async def search_and_persist():
-                    results = await injected_call("tavily_search", lambda: search.search(
-                        action.query, domain=request.options.domain, max_results=min(8, settings.max_pages_per_task),
+                    results = await injected_call("mcp_tavily_search", lambda: discover_and_search(
+                        search, action.query, domain=request.options.domain, max_results=min(8, settings.max_pages_per_task),
                     ))
+                    await check_cancelled()
                     discovered: list[str] = []
                     for result in results:
+                        await check_cancelled()
                         raw_url = result.get("url")
                         if not isinstance(raw_url, str):
                             continue
@@ -285,7 +316,9 @@ async def execute_research(
                     return discovered
 
                 try:
-                    discovered = await attempt_action(step, "tavily_search", search_and_persist)
+                    discovered = await attempt_action(step, "mcp_tavily_search", search_and_persist)
+                except CancellationObserved:
+                    raise
                 except Exception as exc:
                     classification = classify_error(exc)
                     warnings.append(safe_error_text(exc, classification))
@@ -332,6 +365,8 @@ async def execute_research(
                     return
                 source_state = next((item for item in await _persist(repository, "list_sources", task_id) if item["id"] == source["id"]), source)
                 async with semaphore:
+                    # Tasks can wait here while cancellation is requested.
+                    await check_cancelled()
                     await emit("step_started", {"step_id": key, "action_type": "fetch_and_extract", "source_id": source["id"], "title": source["title"] or source["canonical_url"]})
                     if not await is_public_url(source["canonical_url"]):
                         message = "URL was rejected because it was not a verified public HTTP(S) destination"
@@ -342,7 +377,7 @@ async def execute_research(
                         return
 
                     content = None
-                    if source_state.get("fetch_status") == "retrieved" and source_state.get("page_content"):
+                    if source_state.get("page_content"):
                         # Page retrieval was durably acknowledged before a crash; reuse it.
                         content = source_state["page_content"]
                     if content is None:
@@ -350,6 +385,8 @@ async def execute_research(
                             return await injected_call("firecrawl_scrape", lambda: scraper.scrape(source["canonical_url"]))
                         try:
                             page = await attempt_action(step, "firecrawl_scrape", retrieve)
+                        except CancellationObserved:
+                            raise
                         except Exception as exc:
                             classification = classify_error(exc)
                             message = safe_error_text(exc, classification)
@@ -363,6 +400,7 @@ async def execute_research(
                             await emit("step_failed", {"step_id": key, "status": "FAILED", "message": message})
                             return
                         content = page["markdown"][:settings.max_page_content_chars]
+                        await check_cancelled()
                         metadata = page.get("metadata") or {}
                         title = metadata.get("title") or source["title"]
                         await _persist(repository, "update_source", source["id"], {
@@ -375,46 +413,176 @@ async def execute_research(
 
                     saved_findings = await _persist(repository, "list_findings", task_id)
                     existing_source_findings = [item for item in saved_findings if item.get("source_id") == source["id"]]
-                    covered_fields: dict[str, set[str]] = {}
+                    # Old findings are not trusted just because they were durable.
+                    # Keep their values/evidence for audit, but invalidate unsupported
+                    # claims and exclude them from the accepted result set.
+                    rejected_rows = []
+                    accepted_source_findings = []
                     for finding in existing_source_findings:
+                        if finding.get("value_status") != "found":
+                            continue
+                        error = finding_evidence_error(
+                            entity_name=str(finding.get("entity_name", "")),
+                            field_name=str(finding.get("field_name", "")),
+                            field_value=str(finding.get("field_value")) if finding.get("field_value") is not None else None,
+                            value_status="found",
+                            supporting_excerpt=str(finding.get("supporting_excerpt", "")),
+                            source_text=str(source_state.get("page_content") or content or ""),
+                            query=request.query, required_fields=plan.required_fields,
+                        )
+                        if error:
+                            prior_note = str(finding.get("confidence_notes") or "").strip()
+                            rejected_rows.append({
+                                **finding, "field_value": None, "value_status": "unverified",
+                                "verification_status": "rejected_semantic",
+                                "confidence_notes": (prior_note + " " if prior_note else "")
+                                    + f"Previously persisted value excluded during resumed validation: {error}.",
+                            })
+                        elif finding.get("verification_status") == "source_supported":
+                            accepted_source_findings.append(finding)
+                    if rejected_rows:
+                        await check_cancelled()
+                        saved = await _persist(repository, "save_findings_if_active", task_id, worker_id, rejected_rows)
+                        if not saved:
+                            cancellation_observed.set()
+                            raise CancellationObserved()
+                        await emit("finding_rejected", {
+                            "step_id": key, "source_id": source["id"],
+                            "count": len(rejected_rows), "reason": "semantic evidence validation failed",
+                        })
+                    covered_fields: dict[str, set[str]] = {}
+                    for finding in accepted_source_findings:
                         covered_fields.setdefault(finding.get("entity_key", _key(finding.get("entity_name", ""))), set()).add(_key(finding["field_name"]))
                     covered = {_key(field) for field in plan.required_fields}
                     if any(covered.issubset(fields) for fields in covered_fields.values()):
                         # Reconcile a crash after the unique upsert but before step completion.
                         await _persist(repository, "update_step", task_id, key, {
-                            "status": "VERIFIED", "result": {"finding_count": len(existing_source_findings), "source_id": source["id"]},
+                            "status": "VERIFIED", "result": {"finding_count": len(accepted_source_findings), "source_id": source["id"]},
                             "completed_at": utc_now(), "updated_at": utc_now(),
                         })
                         return
 
                     async def extract_and_save():
-                        extraction = await extract_fields(settings, content=content or "", required_fields=plan.required_fields, query=request.query)
-                        _validate_extraction(extraction, plan.required_fields, content or "")
-                        rows = [{
-                            "task_id": task_id, "entity_key": _key(item.entity_name), "entity_name": item.entity_name,
-                            "field_name": item.field_name, "field_value": item.field_value, "value_status": item.value_status,
-                            "source_id": source["id"], "supporting_excerpt": item.supporting_excerpt,
-                            "verification_status": "source_supported" if item.value_status == "found" else "missing_or_uncertain",
-                            "confidence_notes": "Source-backed extraction only; independent cross-checking is not part of this stage.",
-                        } for item in extraction.findings]
-                        # Merge only missing fields for the matching entity; unique keys
-                        # make this safe if the response is lost after the database write.
-                        missing_rows = []
-                        for row in rows:
-                            entity_fields = covered_fields.get(row["entity_key"], set())
-                            if _key(row["field_name"]) not in entity_fields:
-                                missing_rows.append(row)
+                        current_step = await get_step(key) or step
+                        completed_chunks = set((current_step.get("result") or {}).get("completed_chunks", []))
+
+                        async def persist_chunk(chunk_id: str, chunk_result: ExtractionResult) -> None:
+                            await check_cancelled()
+                            _validate_extraction(chunk_result, plan.required_fields, content or "", query=request.query, require_all=False)
+                            durable = await _persist(repository, "list_findings", task_id)
+                            source_findings = [item for item in durable if item.get("source_id") == source["id"]]
+                            existing_by_key = {
+                                (_key(item.get("entity_name", "")), _key(item.get("field_name", ""))): item
+                                for item in source_findings
+                            }
+                            rows = []
+                            for item in chunk_result.findings:
+                                if item.value_status != "found":
+                                    continue
+                                identity = (_key(item.entity_name), _key(item.field_name))
+                                prior = existing_by_key.get(identity)
+                                if prior and prior.get("value_status") == "found":
+                                    continue
+                                rows.append({
+                                    "task_id": task_id, "entity_key": identity[0], "entity_name": item.entity_name,
+                                    "field_name": item.field_name, "field_value": item.field_value, "value_status": item.value_status,
+                                    "source_id": source["id"], "supporting_excerpt": item.supporting_excerpt,
+                                    "verification_status": "source_supported",
+                                    "confidence_notes": "Source-backed extraction only; independent cross-checking is not part of this stage.",
+                                })
+                            if rows:
+                                if not await _persist(repository, "save_findings_if_active", task_id, worker_id, rows):
+                                    cancellation_observed.set()
+                                    raise CancellationObserved()
+                            await check_cancelled()
+                            completed_chunks.add(chunk_id)
+                            prior_result = current_step.get("result") or {}
+                            await _persist(repository, "update_step", task_id, key, {
+                                "result": {**prior_result, "completed_chunks": sorted(completed_chunks)},
+                                "updated_at": utc_now(),
+                            })
+                            if rows:
+                                await emit("finding_extracted", {"step_id": key, "source_id": source["id"], "count": len(rows), "chunk_id": chunk_id})
+
+                        extraction = await extract_fields(
+                            settings, content=content or "", required_fields=plan.required_fields,
+                            query=request.query, completed_chunks=completed_chunks, on_chunk=persist_chunk,
+                            check_cancelled=check_cancelled,
+                        )
+                        await check_cancelled()
+                        _validate_extraction(extraction, plan.required_fields, content or "", query=request.query, require_all=False)
+                        # Also merge the completed aggregate. This is idempotent and
+                        # reconciles a response whose chunk callback was interrupted.
+                        durable = await _persist(repository, "list_findings", task_id)
+                        durable_keys = {
+                            (_key(item.get("entity_name", "")), _key(item.get("field_name", ""))): item
+                            for item in durable if item.get("source_id") == source["id"]
+                        }
+                        final_rows = []
+                        for item in extraction.findings:
+                            if item.value_status != "found":
+                                continue
+                            identity = (_key(item.entity_name), _key(item.field_name))
+                            prior = durable_keys.get(identity)
+                            if prior and prior.get("value_status") == "found":
+                                continue
+                            final_rows.append({
+                                "task_id": task_id, "entity_key": identity[0], "entity_name": item.entity_name,
+                                "field_name": item.field_name, "field_value": item.field_value, "value_status": item.value_status,
+                                "source_id": source["id"], "supporting_excerpt": item.supporting_excerpt,
+                                "verification_status": "source_supported",
+                                "confidence_notes": "Source-backed extraction only; independent cross-checking is not part of this stage.",
+                            })
+                        if final_rows:
+                            if not await _persist(repository, "save_findings_if_active", task_id, worker_id, final_rows):
+                                cancellation_observed.set()
+                                raise CancellationObserved()
+                            await emit("finding_extracted", {"step_id": key, "source_id": source["id"], "count": len(final_rows)})
+                        await check_cancelled()
+                        durable_after = await _persist(repository, "list_findings", task_id)
+                        accepted_after = [
+                            row for row in durable_after
+                            if row.get("source_id") == source["id"]
+                            and row.get("value_status") == "found"
+                            and row.get("verification_status") == "source_supported"
+                        ]
+                        accepted_fields = {_key(row.get("field_name", "")) for row in accepted_after}
+                        established_entities = [row.get("entity_name") for row in accepted_after if row.get("entity_name")]
+                        if established_entities:
+                            missing_entity = established_entities[0]
+                        elif _query_entity := next(iter(re.findall(r"\b[A-Z][A-Z0-9]{1,}\b", request.query)), None):
+                            missing_entity = _query_entity
+                        else:
+                            missing_entity = source.get("title") or urlsplit(source["canonical_url"]).hostname or "Source entity"
+                        missing_rows = [{
+                            "task_id": task_id, "entity_key": _key(str(missing_entity)),
+                            "entity_name": str(missing_entity), "field_name": field,
+                            "field_value": None, "value_status": "unverified",
+                            "source_id": source["id"], "supporting_excerpt": "",
+                            "verification_status": "unverified",
+                            "confidence_notes": "No excerpt in the retrieved content established this requested field.",
+                        } for field in plan.required_fields if _key(field) not in accepted_fields]
                         if missing_rows:
-                            await _persist(repository, "upsert_findings", missing_rows)
+                            if not await _persist(repository, "save_findings_if_active", task_id, worker_id, missing_rows):
+                                cancellation_observed.set()
+                                raise CancellationObserved()
                         if failure_point == "lost_finding_response" and "lost_finding_response" not in used_injections:
                             used_injections.add("lost_finding_response")
                             raise httpx.ReadTimeout("Injected lost response after finding save")
-                        return extraction
+                        return extraction, completed_chunks
 
+                    # Retrieval and extraction share one durable step but have
+                    # separate provider attempts. Refresh its count/status after
+                    # Firecrawl so the extraction attempt cannot collide.
                     step = await get_step(key) or step
                     try:
-                        extraction = await attempt_action(step, "ollama_extract", extract_and_save)
+                        extraction, completed_chunks = await attempt_action(step, "ollama_extract", extract_and_save)
+                    except CancellationObserved:
+                        raise
                     except Exception as exc:
+                        if await _cancel_requested(repository, task_id):
+                            cancellation_observed.set()
+                            raise CancellationObserved() from None
                         classification = classify_error(exc)
                         message = safe_error_text(exc, classification)
                         warnings.append(message)
@@ -426,18 +594,29 @@ async def execute_research(
                         })
                         await emit("step_failed", {"step_id": key, "status": "FAILED", "message": "Page was read, but structured extraction could not be validated."})
                         return
-                    findings_saved += len(extraction.findings)
-                    await emit("finding_extracted", {"step_id": key, "source_id": source["id"], "count": len(extraction.findings), "entity_name": extraction.findings[0].entity_name if extraction.findings else None})
+                    source_findings = [item for item in await _persist(repository, "list_findings", task_id) if item.get("source_id") == source["id"]]
+                    accepted_findings = [item for item in source_findings if item.get("value_status") == "found" and item.get("verification_status") == "source_supported"]
+                    findings_saved += len(accepted_findings)
+                    found_fields = {
+                        _key(item.get("field_name", "")) for item in accepted_findings
+                    }
+                    missing_fields = [_field for _field in plan.required_fields if _key(_field) not in found_fields]
+                    if missing_fields:
+                        warnings.append("No source-supported value was extracted for: " + ", ".join(missing_fields))
+                    await check_cancelled()
+                    await _persist(repository, "update_source", source["id"], {"fetch_status": "retrieved", "quality_notes": None})
                     await _persist(repository, "update_step", task_id, key, {
-                        "status": "VERIFIED", "result": {"finding_count": len(extraction.findings), "source_id": source["id"]},
+                        "status": "VERIFIED", "result": {"finding_count": len(source_findings), "source_id": source["id"], "completed_chunks": sorted(completed_chunks)},
                         "completed_at": utc_now(), "updated_at": utc_now(),
                     })
                     await emit("verification_result", {"step_id": key, "status": "VERIFIED"})
-                    await emit("step_completed", {"step_id": key, "status": "VERIFIED", "findings_saved": len(extraction.findings)})
+                    await emit("step_completed", {"step_id": key, "status": "VERIFIED", "findings_saved": len(source_findings)})
 
             await asyncio.gather(*(process_source(index, source) for index, source in enumerate(candidates.values(), start=1)))
             if await _cancel_requested(repository, task_id):
-                await _persist(repository, "update_task", task_id, {"status": "CANCELLED", "completed_at": utc_now(), "updated_at": utc_now()})
+                finalized = await _persist(repository, "finish_cancellation", task_id, worker_id)
+                if not finalized and hasattr(repository, "finalize_pending_cancellations"):
+                    await _persist(repository, "finalize_pending_cancellations")
                 await emit("task_status", {"status": "CANCELLED", "message": "Cancellation observed; no additional steps will start."})
                 return
             all_steps = await _persist(repository, "list_steps", task_id)
@@ -452,8 +631,12 @@ async def execute_research(
             )
             durable_sources = await _persist(repository, "list_sources", task_id)
             durable_findings = await _persist(repository, "list_findings", task_id)
-            completed_sources = sum(1 for source in durable_sources if source.get("fetch_status") == "retrieved")
-            summary = f"Read {completed_sources} source(s) and saved {len(durable_findings)} source-backed field(s). Extracted values have not been independently cross-checked."
+            accepted_findings = [row for row in durable_findings if row.get("value_status") == "found" and row.get("verification_status") == "source_supported"]
+            completed_sources = sum(
+                1 for source in durable_sources
+                if source.get("fetch_status") == "retrieved" or source.get("page_content")
+            )
+            summary = f"Read {completed_sources} source(s) and saved {len(accepted_findings)} accepted source-backed field(s). Extracted values have not been independently cross-checked."
             if status == "COMPLETED_WITH_LIMITATIONS":
                 summary += f" {len(set(warnings))} issue(s) limited coverage."
             from app.services.transitions import validate_task_completion
@@ -464,7 +647,7 @@ async def execute_research(
             })
             await emit("task_error" if status == "FAILED" else "task_completed", {
                 "status": status, "summary": summary, "sources_read": completed_sources,
-                "findings_saved": len(durable_findings), "limitations": list(dict.fromkeys(warnings)),
+                "findings_saved": len(accepted_findings), "limitations": list(dict.fromkeys(warnings)),
             })
     except WorkerInterrupted:
         if hasattr(repository, "release_task"):
@@ -476,12 +659,36 @@ async def execute_research(
         # immediately to this event can successfully claim the recovery worker.
         await emit_safely("worker_interrupted", {"status": "RUNNING", "message": "Worker stopped at a development recovery point."})
     except CancellationObserved:
-        await _persist(repository, "update_task", task_id, {"status": "CANCELLED", "completed_at": utc_now(), "updated_at": utc_now()})
-        await emit_safely("task_status", {"status": "CANCELLED", "message": "Cancellation observed; no additional steps will start."})
+        try:
+            finalized = await _persist(repository, "finish_cancellation", task_id, worker_id)
+            if not finalized and hasattr(repository, "finalize_pending_cancellations"):
+                await _persist(repository, "finalize_pending_cancellations")
+            await emit_safely("task_status", {"status": "CANCELLED", "message": "Cancellation observed; unfinished steps were stopped."})
+        except Exception as exc:
+            await _fail_task(task_id, f"Cancellation finalization failed ({exc.__class__.__name__})", repository, hub)
     except asyncio.TimeoutError:
-        await _fail_task(task_id, f"Task exceeded MAX_TASK_DURATION_SECONDS ({settings.max_task_duration_seconds})", repository, hub)
+        if await _cancel_requested(repository, task_id):
+            try:
+                await _persist(repository, "finish_cancellation", task_id, worker_id)
+                await emit_safely("task_status", {"status": "CANCELLED", "message": "Cancellation was pending when the worker deadline elapsed."})
+            except Exception as exc:
+                await _fail_task(task_id, f"Cancellation finalization failed ({exc.__class__.__name__})", repository, hub)
+        else:
+            await _record_timeout_outcomes(task_id, repository)
+            await _fail_task(task_id, f"Task exceeded MAX_TASK_DURATION_SECONDS ({settings.max_task_duration_seconds})", repository, hub)
     except Exception as exc:
-        await _fail_task(task_id, str(exc)[:1000] or exc.__class__.__name__, repository, hub)
+        try:
+            cancelled = await _cancel_requested(repository, task_id)
+        except Exception:
+            cancelled = False
+        if cancelled:
+            try:
+                await _persist(repository, "finish_cancellation", task_id, worker_id)
+                await emit_safely("task_status", {"status": "CANCELLED", "message": "Cancellation took precedence over the worker error."})
+            except Exception as finalize_exc:
+                await _fail_task(task_id, f"Cancellation finalization failed ({finalize_exc.__class__.__name__})", repository, hub)
+        else:
+            await _fail_task(task_id, str(exc)[:1000] or exc.__class__.__name__, repository, hub)
     finally:
         if hasattr(repository, "release_task"):
             try:
@@ -496,7 +703,10 @@ async def _cancel_requested(repository: Any, task_id: str) -> bool:
 
 
 async def _fail_task(task_id: str, message: str, repository: Any, hub: ProgressHub) -> None:
-    safe_message = message if message.startswith("Supabase ") else "Unexpected workflow failure; inspect the persisted step attempts for safe diagnostics."
+    safe_message = (
+        message if message.startswith("Supabase ") or message.startswith("Task exceeded MAX_TASK_DURATION_SECONDS")
+        else "Unexpected workflow failure; inspect the persisted step attempts for safe diagnostics."
+    )
     try:
         await _persist(repository, "update_task", task_id, {
             "status": "FAILED", "error_summary": safe_message, "completed_at": utc_now(), "updated_at": utc_now(),
@@ -512,3 +722,29 @@ async def _fail_task(task_id: str, message: str, repository: Any, hub: ProgressH
     except Exception:
         # Preserve the primary failure even when event persistence is unavailable.
         pass
+
+
+async def _record_timeout_outcomes(task_id: str, repository: Any) -> None:
+    """Close durable RUNNING rows when the overall task deadline cancels a provider call."""
+    if not hasattr(repository, "list_attempts") or not hasattr(repository, "list_steps"):
+        return
+    now = utc_now()
+    try:
+        attempts = await _persist(repository, "list_attempts", task_id)
+        for attempt in attempts:
+            if attempt.get("status") == "RUNNING":
+                await _persist(repository, "update_attempt", attempt["id"], {
+                    "status": "FAILED", "error_classification": "timeout",
+                    "safe_error": "Overall task deadline elapsed while provider work was in progress.",
+                    "completed_at": now,
+                })
+        for step in await _persist(repository, "list_steps", task_id):
+            if step.get("status") == "RUNNING":
+                await _persist(repository, "update_step", task_id, step["action_key"], {
+                    "status": "FAILED", "last_error_classification": "timeout",
+                    "last_error": "Overall task deadline elapsed while provider work was in progress.",
+                    "completed_at": now, "updated_at": now,
+                })
+    except Exception:
+        # The timeout remains primary; the terminal task event still records it.
+        return

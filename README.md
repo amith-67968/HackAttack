@@ -1,8 +1,8 @@
 # ProofLoop â€” Stage 3 setup (Windows)
 
-Stage 2 adds the first live research workflow to the Stage 1 React/Vite and FastAPI foundation. The backend creates a structured plan with Ollama, searches with Tavily, reads public pages through Firecrawl, extracts fields with verbatim supporting excerpts, saves task/source/finding records in Supabase, and streams progress over SSE. Research values are source-supported, not independently cross-checked.
+Stage 2 adds the first live research workflow to the Stage 1 React/Vite and FastAPI foundation. The backend creates a structured plan with Ollama, calls Tavily through the Stage 5 MCP tool, reads public pages through Firecrawl, extracts fields with verbatim supporting excerpts, saves task/source/finding records in Supabase, and streams progress over SSE. Research values are source-supported, not independently cross-checked.
 
-Stage 3 adds bounded provider retries, durable attempt and event history, safe task resumption, cancellation and development-only failure injection. Stage 4 artifact generation and Stage 5 MCP integrations are not implemented.
+Stage 3 adds bounded provider retries, durable attempt and event history, safe task resumption, cancellation and development-only failure injection. Stage 4 generates validated spreadsheets, Markdown reports and draft-only email from persisted evidence. Stage 5 routes Tavily search through an official MCP SDK server/client protocol and records MCP tool invocations in attempts and SSE history.
 
 ## Prerequisites
 
@@ -13,7 +13,9 @@ Stage 3 adds bounded provider retries, durable attempt and event history, safe t
 
 ## Configure Supabase
 
-In the Supabase SQL editor, run [`backend/supabase/migrations/20261015_stage2_research.sql`](backend/supabase/migrations/20261015_stage2_research.sql), then [`backend/supabase/migrations/20261016_stage3_recovery.sql`](backend/supabase/migrations/20261016_stage3_recovery.sql), then [`backend/supabase/migrations/20261017_stage3_resume_claim.sql`](backend/supabase/migrations/20261017_stage3_resume_claim.sql). Stage 3 adds task leases/cancellation, attempt history, durable SSE events, supporting page content and database transition guards. Rollback scripts are provided alongside those migrations; reverse order is required. Apply migrations to the same project configured by `SUPABASE_URL`; after SQL Editor changes, allow PostgREST's schema cache to refresh before restarting the API.
+In the Supabase SQL editor, apply any missing migrations in this order: `20261015_stage2_research.sql`, `20261016_stage3_recovery.sql`, `20261017_stage3_resume_claim.sql`, `20261018_stage3_cancellation_evidence.sql`, then [`backend/supabase/migrations/20261019_stage4_artifacts.sql`](backend/supabase/migrations/20261019_stage4_artifacts.sql). Do not rerun migrations blindly: first confirm which were applied in the configured project. Stage 4 adds artifact metadata; the rollback file removes metadata but stored objects/files need separate cleanup. After SQL changes, allow PostgREST's schema cache to refresh before restarting the API.
+
+For Supabase artifact storage, create the configured `SUPABASE_STORAGE_BUCKET` manually as a **private** bucket before generating artifacts. The backend uploads using its service-role key; the download endpoint issues a short-lived signed URL. Set `ARTIFACT_STORAGE_BACKEND=local` to use the contained `ARTIFACT_DIR` instead. `auto` selects Supabase when backend credentials are configured and local storage otherwise. Do not expose local artifacts through a public static directory.
 
 Stage 2 runs in documented local single-user mode: the backend uses its service-role key, and the API must remain bound to loopback (`127.0.0.1`). Authentication and ownership checks for a remotely exposed API are not implemented in this stage. Never put the service-role key in frontend configuration.
 
@@ -59,7 +61,7 @@ Open the Vite URL (normally `http://localhost:5173`). The frontend only reads `V
 
 ## Limits
 
-`backend/.env.example` documents all variables. Search query count, pages per task, page-content length, total task duration, provider timeouts, research concurrency, retry attempts and backoff are configurable. Concurrency defaults to one. `MAX_PROVIDER_ATTEMPTS` defaults to three; authentication, authorization and validation errors are not retried. Keep `FAILURE_INJECTION_ENABLED=false` except for local test runs. When explicitly enabled in development/test, the UI offers deterministic simulated failures; production requests reject failure injection.
+`backend/.env.example` documents all variables, including `ARTIFACT_STORAGE_BACKEND` (`auto`, `local`, or `supabase`) and `ARTIFACT_DIR`. Search query count, pages per task, page-content length, total task duration, provider timeouts, research concurrency, retry attempts and backoff are configurable. Concurrency defaults to one. `MAX_PROVIDER_ATTEMPTS` defaults to three; authentication, authorization and validation errors are not retried. Keep `FAILURE_INJECTION_ENABLED=false` except for local test runs. When explicitly enabled in development/test, the UI offers deterministic simulated failures; production requests reject failure injection. Artifact endpoints are `POST /api/research/{task_id}/artifacts`, `GET /api/research/{task_id}/artifacts`, and `GET /api/artifacts/{artifact_id}/download`.
 
 Task attempts and SSE event history are persisted. Reconnecting clients replay from their last event sequence; task execution resumes through `POST /api/research/{task_id}/resume`, and cancellation is requested through `POST /api/research/{task_id}/cancel`. External GET calls may be repeated after an ambiguous outcome; source/finding writes use stable keys and reconciliation, so exactly-once provider execution is not claimed. The API uses service-role credentials in local single-user mode and is restricted to loopback. Do not expose it publicly without adding authenticated ownership enforcement.
 

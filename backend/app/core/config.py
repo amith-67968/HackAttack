@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -20,6 +21,8 @@ class Settings(BaseSettings):
     supabase_anon_key: str = ""
     supabase_service_role_key: str = ""
     supabase_storage_bucket: str = "proofloop-artifacts"
+    artifact_storage_backend: Literal["auto", "local", "supabase"] = "auto"
+    artifact_dir: str = "./artifacts"
     tavily_api_key: str = ""
     firecrawl_api_key: str = ""
     max_search_queries: int = Field(default=3, ge=1, le=5)

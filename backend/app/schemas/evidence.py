@@ -8,11 +8,11 @@ class ExtractedField(BaseModel):
 
     entity_name: str = Field(min_length=1, max_length=300)
     field_name: str = Field(min_length=1, max_length=100)
-    # Keep nullable values required in the generated JSON schema so local models
-    # cannot omit this key when reporting a found field.
-    field_value: str | None = Field(max_length=2000)
+    # Defaults keep the local-model JSON schema within a broadly supported subset.
+    # The application validates status/value consistency after parsing.
+    field_value: str | None = Field(default=None, max_length=2000)
     value_status: Literal["found", "not_found", "not_disclosed", "unverified", "conflicting"]
-    supporting_excerpt: str = Field(max_length=1200)
+    supporting_excerpt: str = Field(default="", max_length=1200)
 
     @model_validator(mode="after")
     def check_value_status(self):

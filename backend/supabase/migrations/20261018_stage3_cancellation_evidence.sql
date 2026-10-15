@@ -16,11 +16,16 @@ begin
         return null;
     end if;
 
-    update public.research_steps
+    update public.research_steps as target_step
        set status = 'RUNNING', attempt_count = p_attempt_no,
            started_at = now(), completed_at = null, updated_at = now()
-     where task_id = p_task_id and action_key = p_action_key
-       and status in ('PENDING','RETRYING','FAILED')
+     where target_step.task_id = p_task_id and target_step.action_key = p_action_key
+       and target_step.status in ('PENDING','RUNNING','RETRYING','FAILED')
+       and not exists (
+           select 1 from public.research_step_attempts active_attempt
+            where active_attempt.step_id = target_step.id
+              and active_attempt.status = 'RUNNING'
+       )
      returning * into step_row;
     if not found then return null; end if;
 
@@ -92,6 +97,20 @@ begin
            completed_at = case when status = 'QUEUED' and worker_id is null then now() else completed_at end,
            updated_at = now()
      where id = p_task_id;
+    perform public.append_research_task_event(
+        p_task_id, 'task_cancel_requested',
+        jsonb_build_object('task_id', p_task_id, 'status', 'CANCELLATION_REQUESTED')
+    );
+    if task_row.status = 'QUEUED' and task_row.worker_id is null then
+        update public.research_steps set status = 'SKIPPED', completed_at = now(), updated_at = now()
+         where task_id = p_task_id and status in ('PENDING','RUNNING','RETRYING');
+        update public.research_step_attempts set status = 'INTERRUPTED', completed_at = now(),
+               error_classification = 'cancelled', safe_error = 'Task was cancelled before a worker started.'
+         where task_id = p_task_id and status = 'RUNNING';
+        perform public.append_research_task_event(
+            p_task_id, 'task_status', jsonb_build_object('task_id', p_task_id, 'status', 'CANCELLED')
+        );
+    end if;
     return true;
 end;
 $$;
@@ -104,7 +123,16 @@ declare task_row public.research_tasks%rowtype;
 begin
     select * into task_row from public.research_tasks where id = p_task_id for update;
     if not found then return false; end if;
-    if task_row.status = 'CANCELLED' then return true; end if;
+    if task_row.status = 'CANCELLED' then
+        -- Reconcile rows left pending by earlier cancellation handlers while
+        -- keeping this RPC idempotent for already terminal tasks.
+        update public.research_steps set status = 'SKIPPED', completed_at = now(), updated_at = now()
+         where task_id = p_task_id and status in ('PENDING','RUNNING','RETRYING');
+        update public.research_step_attempts set status = 'INTERRUPTED', completed_at = now(),
+               error_classification = 'cancelled', safe_error = 'Cancellation was acknowledged before the attempt completed.'
+         where task_id = p_task_id and status = 'RUNNING';
+        return true;
+    end if;
     if not task_row.cancel_requested
        or (task_row.worker_id is not null and task_row.worker_id is distinct from p_worker_id) then
         return false;

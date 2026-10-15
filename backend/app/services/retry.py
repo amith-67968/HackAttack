@@ -8,6 +8,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
+from pydantic import ValidationError
 
 
 @dataclass(frozen=True)
@@ -50,11 +51,22 @@ def _retry_after(exc: BaseException) -> float | None:
 
 def classify_error(exc: BaseException) -> ErrorClassification:
     """Classify provider errors without including their messages or response bodies."""
+    # Async MCP/client context managers may aggregate a single remote tool
+    # failure into an ExceptionGroup. Preserve the nested provider classification.
+    if isinstance(exc, BaseExceptionGroup):
+        for nested_exc in exc.exceptions:
+            nested = classify_error(nested_exc)
+            if nested.retryable or nested.name != "unknown":
+                return nested
     status = getattr(exc, "status_code", None)
     response = getattr(exc, "response", None)
     if status is None and response is not None:
         status = getattr(response, "status_code", None)
     retry_after = _retry_after(exc)
+
+    failure_kind = getattr(exc, "failure_kind", None)
+    if failure_kind == "validation" or isinstance(exc, ValidationError):
+        return ErrorClassification("validation", False)
 
     if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
         return ErrorClassification("timeout", True, retry_after)
@@ -85,6 +97,8 @@ def retry_delay(attempt_no: int, *, base_seconds: float, max_seconds: float, jit
 
 
 def safe_error_text(exc: BaseException, classification: ErrorClassification) -> str:
+    if classification.name == "validation":
+        return "structured output validation failed"
     status = getattr(exc, "status_code", None)
     response = getattr(exc, "response", None)
     if status is None and response is not None:

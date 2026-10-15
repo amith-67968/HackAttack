@@ -32,6 +32,9 @@ class TaskRepository(Protocol):
     def list_findings(self, task_id: str) -> list[dict[str, Any]]: ...
     def list_steps(self, task_id: str) -> list[dict[str, Any]]: ...
     def list_events(self, task_id: str, after: int = 0, limit: int = 100) -> list[dict[str, Any]]: ...
+    def list_artifacts(self, task_id: str) -> list[dict[str, Any]]: ...
+    def get_artifact(self, artifact_id: str) -> dict[str, Any] | None: ...
+    def save_artifact(self, row: dict[str, Any]) -> dict[str, Any]: ...
     def append_event(self, task_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]: ...
 
 
@@ -42,6 +45,7 @@ class SupabaseTaskRepository:
     _READ_OPERATIONS = frozenset({
         "task lookup", "step lookup", "step listing", "attempt listing",
         "source lookup", "source listing", "finding listing", "event listing",
+        "artifact listing", "artifact lookup",
     })
 
     def __init__(self, url: str, service_role_key: str, *, client: Client | None = None) -> None:
@@ -228,6 +232,30 @@ class SupabaseTaskRepository:
             "event listing", self._client.table("research_task_events").select("*").eq("task_id", task_id)
             .gt("sequence_no", after).order("sequence_no").limit(min(max(limit, 1), 500))
         )
+
+    def list_artifacts(self, task_id: str) -> list[dict[str, Any]]:
+        return self._execute("artifact listing", self._client.table("artifacts").select("*").eq("task_id", task_id).order("created_at", desc=True))
+
+    def get_artifact(self, artifact_id: str) -> dict[str, Any] | None:
+        data = self._execute("artifact lookup", self._client.table("artifacts").select("*").eq("id", artifact_id).limit(1))
+        return data[0] if data else None
+
+    def save_artifact(self, row: dict[str, Any]) -> dict[str, Any]:
+        data = self._execute("artifact save", self._client.table("artifacts").upsert(row, on_conflict="id"))
+        return data[0] if data else row
+
+    def upload_artifact(self, bucket: str, path: str, payload: bytes, mime_type: str) -> None:
+        try:
+            self._client.storage.from_(bucket).upload(path, payload, {"content-type": mime_type, "upsert": "true"})
+        except Exception as exc:
+            raise PersistenceError(f"Supabase artifact upload failed ({exc.__class__.__name__})") from exc
+
+    def signed_artifact_url(self, bucket: str, path: str, expires_seconds: int = 300) -> str:
+        try:
+            result = self._client.storage.from_(bucket).create_signed_url(path, expires_seconds)
+            return result.get("signedURL") or result.get("signedUrl")
+        except Exception as exc:
+            raise PersistenceError(f"Supabase artifact download URL failed ({exc.__class__.__name__})") from exc
 
     def claim_task(self, task_id: str, worker_id: str, *, resume: bool) -> bool:
         try:

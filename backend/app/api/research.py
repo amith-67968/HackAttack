@@ -4,18 +4,23 @@ import json
 from datetime import datetime, timezone
 from typing import AsyncIterator
 from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, uuid5
+from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 
 from app.core.config import Settings, get_settings
 from app.repositories.tasks import PersistenceError, SupabaseTaskRepository
 from app.schemas.research import ResearchAccepted, ResearchRequest
+from app.schemas.artifacts import ArtifactRequest
+from app.services.artifacts import MIMES, artifact_filename, build_artifact, store_local
 from app.services.ollama import check_ollama
 from app.services.progress import ProgressHub, progress_hub
 from app.services.research_workflow import execute_research
 
 router = APIRouter(prefix="/research", tags=["research"])
+artifact_router = APIRouter(tags=["artifacts"])
 
 
 def get_repository(settings: Settings = Depends(get_settings)) -> SupabaseTaskRepository:
@@ -176,6 +181,92 @@ async def get_findings(task_id: str, repository: SupabaseTaskRepository = Depend
     return {"findings": findings}
 
 
+def _artifact_public(row: dict) -> dict:
+    return {key: row.get(key) for key in ("id", "task_id", "artifact_type", "filename", "mime_type", "status", "preview", "created_at")}
+
+
+@router.get("/{task_id}/artifacts")
+async def list_research_artifacts(task_id: str, repository: SupabaseTaskRepository = Depends(get_repository)):
+    task = await _get_task_or_404(task_id, repository)
+    try:
+        return {"artifacts": [_artifact_public(row) for row in await asyncio.to_thread(repository.list_artifacts, task["id"])]}
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail={"code": "artifact_read_failed", "message": str(exc)}) from exc
+
+
+@router.post("/{task_id}/artifacts", status_code=201)
+async def create_research_artifact(task_id: str, body: ArtifactRequest, settings: Settings = Depends(get_settings), repository: SupabaseTaskRepository = Depends(get_repository)):
+    task = await _get_task_or_404(task_id, repository)
+    if task.get("status") == "CANCELLED":
+        raise HTTPException(status_code=409, detail={"code": "task_cancelled", "message": "Artifacts cannot be generated for a cancelled task."})
+    if body.recipient and not __import__("re").fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", body.recipient):
+        raise HTTPException(status_code=422, detail="recipient must be a valid email address")
+    try:
+        sources, findings = await asyncio.gather(
+            asyncio.to_thread(repository.list_sources, task["id"]),
+            asyncio.to_thread(repository.list_findings, task["id"]),
+        )
+        payload, preview = build_artifact(task, findings, sources, body.artifact_type, body.recipient)
+        generation_key = f"{body.artifact_type}:{hashlib.sha256((body.recipient or '').encode()).hexdigest()[:16]}"
+        artifact_id = str(uuid5(NAMESPACE_URL, f"proofloop:{task['id']}:{generation_key}"))
+        filename = artifact_filename(body.artifact_type, task["id"])
+        backend = settings.artifact_storage_backend
+        if backend == "auto":
+            backend = "supabase" if settings.supabase_configured else "local"
+        if backend == "supabase":
+            if not settings.supabase_configured:
+                raise HTTPException(status_code=503, detail={"code": "artifact_storage_not_configured", "message": "Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY or set ARTIFACT_STORAGE_BACKEND=local."})
+            storage_path = f"{task['id']}/{artifact_id}/{filename}"
+            await asyncio.to_thread(repository.upload_artifact, settings.supabase_storage_bucket, storage_path, payload, MIMES[body.artifact_type])
+        else:
+            storage_path = await asyncio.to_thread(store_local, settings.artifact_dir, artifact_id, payload)
+        row = {
+            "id": artifact_id, "task_id": task["id"], "artifact_type": body.artifact_type,
+            "generation_key": generation_key, "filename": filename, "storage_backend": backend,
+            "storage_path": storage_path, "mime_type": MIMES[body.artifact_type], "status": "READY",
+            "preview": preview, "content_hash": hashlib.sha256(payload).hexdigest(),
+        }
+        saved = await asyncio.to_thread(repository.save_artifact, row)
+        try:
+            await asyncio.to_thread(repository.append_event, task["id"], "artifact_generated", {"artifact_id": artifact_id, "artifact_type": body.artifact_type, "status": "READY"})
+        except Exception:
+            pass
+        return _artifact_public(saved)
+    except HTTPException:
+        raise
+    except PersistenceError as exc:
+        message = str(exc)
+        if "artifacts" in message.lower() or "PGRST205" in message:
+            message = "Artifact table is unavailable. Apply backend/supabase/migrations/20261019_stage4_artifacts.sql to the configured Supabase project and refresh the PostgREST schema cache."
+        raise HTTPException(status_code=503, detail={"code": "artifact_persistence_failed", "message": message}) from exc
+
+
+@artifact_router.get("/artifacts/{artifact_id}/download")
+async def download_artifact(artifact_id: str, settings: Settings = Depends(get_settings), repository: SupabaseTaskRepository = Depends(get_repository)):
+    try:
+        artifact_id = str(UUID(artifact_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="artifact_id must be a UUID") from exc
+    try:
+        row = await asyncio.to_thread(repository.get_artifact, artifact_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        if row.get("storage_backend") == "supabase":
+            url = await asyncio.to_thread(repository.signed_artifact_url, settings.supabase_storage_bucket, row["storage_path"], 300)
+            if not url:
+                raise HTTPException(status_code=503, detail={"code": "artifact_url_failed", "message": "Supabase did not return a signed download URL."})
+            return RedirectResponse(url, status_code=307)
+        root = Path(settings.artifact_dir).expanduser().resolve()
+        path = Path(row["storage_path"]).resolve()
+        if root not in path.parents or not path.is_file():
+            raise HTTPException(status_code=404, detail="Artifact file is unavailable")
+        return FileResponse(path, media_type=row["mime_type"], filename=row["filename"])
+    except HTTPException:
+        raise
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail={"code": "artifact_download_failed", "message": str(exc)}) from exc
+
+
 @router.post("/{task_id}/resume", response_model=ResearchAccepted, status_code=status.HTTP_202_ACCEPTED)
 async def resume_research(
     task_id: str,
@@ -274,8 +365,6 @@ async def cancel_research(task_id: str, repository: SupabaseTaskRepository = Dep
         raise HTTPException(status_code=409, detail={"code": "task_not_cancellable", "message": f"A {task.get('status')} task cannot be cancelled."})
     try:
         requested = await asyncio.to_thread(repository.request_cancel, task["id"])
-        if requested:
-            await asyncio.to_thread(repository.append_event, task["id"], "task_cancel_requested", {"task_id": task["id"], "status": "CANCELLATION_REQUESTED"})
     except PersistenceError as exc:
         raise HTTPException(status_code=503, detail={"code": "cancel_failed", "message": str(exc)}) from exc
     if not requested:
