@@ -4,7 +4,7 @@ import httpx
 
 
 class FirecrawlError(RuntimeError):
-    def __init__(self, message: str, status_code: int | None = None, retry_after_seconds: float | None = None) -> None:
+    def __init__(self, message: str, status_code: int | None = None, retry_after_seconds: float | str | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retry_after_seconds = retry_after_seconds
@@ -43,8 +43,4 @@ class FirecrawlScraper:
             status = getattr(response, "status_code", None)
             category = "rate limited" if status == 429 else "request failed"
             retry_after = getattr(response, "headers", {}).get("Retry-After") if response is not None else None
-            try:
-                retry_after = float(retry_after) if retry_after is not None else None
-            except ValueError:
-                retry_after = None
             raise FirecrawlError(f"Firecrawl {category}: {status or exc.__class__.__name__}", status, retry_after) from exc
