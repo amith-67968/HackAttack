@@ -1,8 +1,7 @@
 -- ProofLoop Stage 3 durability, retries, resumability and event replay.
--- Rollback: drop the four functions/triggers added here, then drop
--- research_task_events, research_step_attempts and task_event_counters; finally
--- drop last_error_classification and page_content, then the three Stage 3
--- columns from research_steps, sources and research_tasks respectively.
+-- Rollback: if 20261017_stage3_resume_claim.sql was applied, run its rollback
+-- first. Then apply 20261016_stage3_recovery_rollback.sql. Stage 3 attempt,
+-- event and page-content data will be removed by rollback.
 
 alter table public.research_tasks
     add column if not exists cancel_requested boolean not null default false,
@@ -63,9 +62,10 @@ grant select, insert, update, delete on public.research_task_events, public.rese
 create or replace function public.append_research_task_event(p_task_id uuid, p_event_type text, p_payload jsonb)
 returns table(id uuid, sequence_no bigint, created_at timestamptz)
 language plpgsql security definer set search_path = public, pg_temp as $$
-declare next_sequence bigint;
-declare event_id uuid;
-declare event_created_at timestamptz;
+declare
+    next_sequence bigint;
+    event_id uuid;
+    event_created_at timestamptz;
 begin
     insert into public.task_event_counters(task_id, last_sequence) values (p_task_id, 1)
     on conflict (task_id) do update set last_sequence = task_event_counters.last_sequence + 1
@@ -93,12 +93,17 @@ begin
                lease_expires_at = now() + interval '5 minutes', cancel_requested = false,
                completed_at = null, updated_at = now()
          where t.id = p_task_id
-           and t.status in ('FAILED','COMPLETED_WITH_LIMITATIONS','RUNNING','RECOVERING')
+           and t.status in ('QUEUED','PLANNING','FAILED','COMPLETED_WITH_LIMITATIONS','RUNNING','RECOVERING')
            and (t.worker_id is null or t.lease_expires_at is null or t.lease_expires_at < now())
-           and exists (select 1 from public.research_steps s where s.task_id = t.id
+           and (
+               exists (select 1 from public.research_steps s where s.task_id = t.id
                        and (s.status in ('PENDING','RUNNING','RETRYING') or
-                            (s.status = 'FAILED' and s.last_error_classification in
-                             ('connection','timeout','rate_limited','temporary_server_error','interrupted'))))
+                            (s.status = 'FAILED' and coalesce(s.last_error_classification, 'unknown') not in
+                             ('authorization','validation'))))
+               or exists (select 1 from public.sources src where src.task_id = t.id and src.fetch_status in ('discovered','retrieved','fetch_failed','extraction_failed'))
+               or (t.status in ('RUNNING','RECOVERING') and t.plan is not null)
+               or (t.status in ('QUEUED','PLANNING') and t.plan is null)
+           )
         returning true into claimed;
         if coalesce(claimed, false) then
             update public.research_steps set status = 'RETRYING', updated_at = now()
@@ -141,8 +146,13 @@ create or replace function public.request_research_cancellation(p_task_id uuid)
 returns boolean language plpgsql security definer set search_path = public, pg_temp as $$
 declare changed boolean := false;
 begin
-    update public.research_tasks set cancel_requested = true, updated_at = now()
-     where id = p_task_id and status not in ('COMPLETED','CANCELLED') returning true into changed;
+    update public.research_tasks
+       set cancel_requested = true,
+           status = case when status = 'QUEUED' and worker_id is null then 'CANCELLED' else status end,
+           completed_at = case when status = 'QUEUED' and worker_id is null then now() else completed_at end,
+           updated_at = now()
+     where id = p_task_id and status not in ('COMPLETED','COMPLETED_WITH_LIMITATIONS','FAILED','CANCELLED')
+     returning true into changed;
     return coalesce(changed, false);
 end;
 $$;
