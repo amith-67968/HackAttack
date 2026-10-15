@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     max_page_content_chars: int = Field(default=24000, ge=1000, le=100000)
     max_research_concurrency: int = Field(default=1, ge=1, le=4)
     provider_timeout_seconds: float = Field(default=30.0, gt=0, le=180)
+    max_provider_attempts: int = Field(default=3, ge=1, le=5)
+    retry_base_delay_seconds: float = Field(default=0.5, ge=0, le=30)
+    retry_max_delay_seconds: float = Field(default=8, ge=0, le=120)
+    failure_injection_enabled: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
