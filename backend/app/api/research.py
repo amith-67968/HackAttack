@@ -1,9 +1,11 @@
 import asyncio
+import hashlib
 import json
+from datetime import datetime, timezone
 from typing import AsyncIterator
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
 from app.core.config import Settings, get_settings
@@ -55,22 +57,29 @@ async def create_research(
     settings: Settings = Depends(require_research_providers),
     repository: SupabaseTaskRepository = Depends(get_repository),
 ):
-    from uuid import uuid4
-
+    if body.failure_injection and not (settings.failure_injection_enabled and settings.app_env in {"development", "test"}):
+        raise HTTPException(status_code=403, detail={"code": "failure_injection_disabled", "message": "Failure injection is available only when explicitly enabled in development or test mode."})
     task_id = str(uuid4())
+    worker_id = str(uuid4())
     row = {
         "id": task_id,
         "query": body.query,
         "output_type": body.output_type,
         "research_depth": body.research_depth,
         "status": "QUEUED",
-        "config": {"target_count": body.target_count, **body.options.model_dump(mode="json")},
+        "config": {"target_count": body.target_count, **body.options.model_dump(mode="json"), "failure_injection": body.failure_injection},
     }
     try:
         await asyncio.to_thread(repository.create_task, row)
     except PersistenceError as exc:
         raise HTTPException(status_code=503, detail={"code": "supabase_write_failed", "message": str(exc)}) from exc
-    background_tasks.add_task(execute_research, task_id, body, settings, repository, progress_hub)
+    try:
+        await asyncio.to_thread(repository.append_event, task_id, "task_status", {"task_id": task_id, "status": "QUEUED", "message": "Task accepted and durably queued."})
+        if hasattr(repository, "claim_task") and not await asyncio.to_thread(repository.claim_task, task_id, worker_id, resume=False):
+            raise HTTPException(status_code=409, detail={"code": "task_claim_conflict", "message": "The task could not be claimed for execution."})
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail={"code": "task_start_failed", "message": str(exc)}) from exc
+    background_tasks.add_task(execute_research, task_id, body, settings, repository, progress_hub, worker_id=worker_id)
     return ResearchAccepted(task_id=task_id, status="QUEUED", events_url=f"/api/research/{task_id}/events")
 
 
@@ -91,9 +100,47 @@ async def _get_task_or_404(task_id: str, repository: SupabaseTaskRepository) -> 
     return task
 
 
+async def _resume_eligibility(task: dict, repository: SupabaseTaskRepository) -> bool:
+    task_id = task["id"]
+    if task.get("status") in {"COMPLETED", "CANCELLED"}:
+        return False
+    steps, sources = await asyncio.gather(
+        asyncio.to_thread(repository.list_steps, task_id),
+        asyncio.to_thread(repository.list_sources, task_id),
+    )
+    unresolved = any(step.get("status") in {"PENDING", "RUNNING", "RETRYING"} for step in steps)
+    safe_failed = any(step.get("status") == "FAILED" and step.get("last_error_classification") not in {"authorization", "validation"} for step in steps)
+    step_by_key = {step.get("action_key"): step for step in steps}
+    recoverable_source = False
+    for source in sources:
+        key = "read_" + hashlib.sha256(source["canonical_url"].encode()).hexdigest()[:24]
+        read_step = step_by_key.get(key)
+        if read_step is None or read_step.get("status") in {"PENDING", "RUNNING", "RETRYING"}:
+            recoverable_source = True
+            break
+        if read_step.get("status") == "FAILED" and read_step.get("last_error_classification") not in {"authorization", "validation"}:
+            recoverable_source = True
+            break
+    if not (unresolved or safe_failed or recoverable_source or (task.get("status") in {"QUEUED", "PLANNING"} and task.get("plan") is None) or (task.get("status") in {"RUNNING", "RECOVERING"} and task.get("plan") is not None)):
+        return False
+    try:
+        expiry = datetime.fromisoformat(str(task.get("lease_expires_at")).replace("Z", "+00:00"))
+        if task.get("worker_id") and expiry > datetime.now(timezone.utc):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return task.get("status") in {"QUEUED", "PLANNING", "FAILED", "COMPLETED_WITH_LIMITATIONS", "RUNNING", "RECOVERING"}
+
+
 @router.get("/{task_id}")
 async def get_research(task_id: str, repository: SupabaseTaskRepository = Depends(get_repository)):
-    return await _get_task_or_404(task_id, repository)
+    task = await _get_task_or_404(task_id, repository)
+    try:
+        task["resume_eligible"] = await _resume_eligibility(task, repository)
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail={"code": "recovery_state_read_failed", "message": str(exc)}) from exc
+    task["cancel_eligible"] = task.get("status") in {"QUEUED", "PLANNING", "RUNNING", "RECOVERING"} and not task.get("cancel_requested")
+    return task
 
 
 @router.get("/{task_id}/sources")
@@ -116,9 +163,98 @@ async def get_findings(task_id: str, repository: SupabaseTaskRepository = Depend
     return {"findings": findings}
 
 
+@router.post("/{task_id}/resume", response_model=ResearchAccepted, status_code=status.HTTP_202_ACCEPTED)
+async def resume_research(
+    task_id: str,
+    background_tasks: BackgroundTasks,
+    settings: Settings = Depends(require_research_providers),
+    repository: SupabaseTaskRepository = Depends(get_repository),
+):
+    task = await _get_task_or_404(task_id, repository)
+    task_id = task["id"]
+    if task.get("status") in {"COMPLETED", "CANCELLED"}:
+        raise HTTPException(status_code=409, detail={"code": "task_not_resumable", "message": f"A {task.get('status')} task cannot be resumed."})
+    if task.get("status") not in {"QUEUED", "PLANNING", "FAILED", "COMPLETED_WITH_LIMITATIONS", "RUNNING", "RECOVERING"}:
+        raise HTTPException(status_code=409, detail={"code": "task_not_resumable", "message": "Only interrupted or recoverable tasks can be resumed."})
+    try:
+        steps = await asyncio.to_thread(repository.list_steps, task_id)
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail={"code": "supabase_read_failed", "message": str(exc)}) from exc
+    unresolved = [step for step in steps if step.get("status") in {"PENDING", "RUNNING", "RETRYING"}]
+    safe_failed = [step for step in steps if step.get("status") == "FAILED" and step.get("last_error_classification") not in {"authorization", "validation"}]
+    try:
+        sources = await asyncio.to_thread(repository.list_sources, task_id)
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail={"code": "supabase_read_failed", "message": str(exc)}) from exc
+    step_by_key = {step.get("action_key"): step for step in steps}
+    recoverable_sources = []
+    for source in sources:
+        key = "read_" + hashlib.sha256(source["canonical_url"].encode()).hexdigest()[:24]
+        read_step = step_by_key.get(key)
+        if read_step is None or read_step.get("status") in {"PENDING", "RUNNING", "RETRYING"}:
+            recoverable_sources.append(source)
+        elif read_step.get("status") == "FAILED" and read_step.get("last_error_classification") not in {"authorization", "validation"}:
+            recoverable_sources.append(source)
+    if not unresolved and not safe_failed and not recoverable_sources and not (task.get("status") in {"QUEUED", "PLANNING"} and task.get("plan") is None) and task.get("status") not in {"RUNNING", "RECOVERING"}:
+        raise HTTPException(status_code=409, detail={"code": "task_not_resumable", "message": "The task has no unfinished or safely retryable steps."})
+    worker_id = str(uuid4())
+    try:
+        claimed = await asyncio.to_thread(repository.claim_task, task_id, worker_id, resume=True)
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail={"code": "task_claim_failed", "message": str(exc)}) from exc
+    if not claimed:
+        latest = await _get_task_or_404(task_id, repository)
+        try:
+            lease_expiry = datetime.fromisoformat(str(latest.get("lease_expires_at")).replace("Z", "+00:00"))
+            active_lease = bool(latest.get("worker_id")) and lease_expiry > datetime.now(timezone.utc)
+        except (TypeError, ValueError):
+            active_lease = False
+        if active_lease:
+            raise HTTPException(status_code=409, detail={"code": "task_already_running", "message": "Another worker holds the task lease."})
+        raise HTTPException(status_code=409, detail={
+            "code": "task_claim_rejected",
+            "message": "Supabase rejected the recovery claim although no worker lease is active. Apply backend/supabase/migrations/20261017_stage3_resume_claim.sql, then retry resume.",
+        })
+    body = ResearchRequest(
+        query=task["query"], output_type=task.get("output_type", "auto"),
+        research_depth=task.get("research_depth", "standard"),
+        target_count=(task.get("config") or {}).get("target_count"),
+        options={key: (task.get("config") or {}).get(key) for key in ("location", "domain", "required_fields")},
+        failure_injection=(task.get("config") or {}).get("failure_injection"),
+    )
+    try:
+        await asyncio.to_thread(repository.append_event, task_id, "task_resumed", {"task_id": task_id, "status": "RECOVERING"})
+    except PersistenceError as exc:
+        try:
+            await asyncio.to_thread(repository.update_task, task_id, {"status": "FAILED", "error_summary": "Recovery could not be recorded in durable event history."})
+            await asyncio.to_thread(repository.release_task, task_id, worker_id)
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail={"code": "event_write_failed", "message": str(exc)}) from exc
+    background_tasks.add_task(execute_research, task_id, body, settings, repository, progress_hub, resume=True, worker_id=worker_id)
+    return ResearchAccepted(task_id=task_id, status="RECOVERING", events_url=f"/api/research/{task_id}/events")
+
+
+@router.post("/{task_id}/cancel")
+async def cancel_research(task_id: str, repository: SupabaseTaskRepository = Depends(get_repository)):
+    task = await _get_task_or_404(task_id, repository)
+    if task.get("status") in {"COMPLETED", "COMPLETED_WITH_LIMITATIONS", "FAILED", "CANCELLED"}:
+        raise HTTPException(status_code=409, detail={"code": "task_not_cancellable", "message": f"A {task.get('status')} task cannot be cancelled."})
+    try:
+        requested = await asyncio.to_thread(repository.request_cancel, task["id"])
+        if requested:
+            await asyncio.to_thread(repository.append_event, task["id"], "task_cancel_requested", {"task_id": task["id"], "status": "CANCELLATION_REQUESTED"})
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail={"code": "cancel_failed", "message": str(exc)}) from exc
+    if not requested:
+        raise HTTPException(status_code=409, detail={"code": "task_not_cancellable", "message": "Cancellation was not accepted by the current task state."})
+    return {"task_id": task["id"], "status": "CANCELLATION_REQUESTED"}
+
+
 @router.get("/{task_id}/events")
 async def get_research_events(
     task_id: str,
+    request: Request,
     after: int = Query(default=0, ge=0),
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
     repository: SupabaseTaskRepository = Depends(get_repository),
@@ -126,20 +262,43 @@ async def get_research_events(
     task = await _get_task_or_404(task_id, repository)
     if last_event_id and last_event_id.isdigit():
         after = max(after, int(last_event_id))
-    history = progress_hub.history(task["id"])
+    cursor = after
+    history_id = last_event_id
+    if history_id and history_id.isdigit():
+        cursor = max(cursor, int(history_id))
     terminal_statuses = {"COMPLETED", "COMPLETED_WITH_LIMITATIONS", "FAILED", "CANCELLED"}
-    terminal_events = {"task_completed", "task_error"}
 
     async def events() -> AsyncIterator[str]:
-        if task.get("status") in terminal_statuses and not any(event["event"] in terminal_events for event in history):
-            kind = "task_error" if task["status"] == "FAILED" else "task_completed"
-            data = {"task_id": task["id"], "status": task["status"], "summary": task.get("summary"), "message": task.get("error_summary")}
-            yield f"event: {kind}\nid: 1\ndata: {json.dumps(data)}\n\n"
-            return
-        terminal_ids = [event["id"] for event in history if event["event"] in terminal_events]
-        if task.get("status") in terminal_statuses and terminal_ids and after >= terminal_ids[-1]:
-            return
-        async for event in progress_hub.stream(task["id"], after):
-            yield f"event: {event['event']}\nid: {event['id']}\ndata: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
+        nonlocal cursor
+        idle_polls = 0
+        terminal_empty_polls = 0
+        stream_deadline = asyncio.get_running_loop().time() + get_settings().max_sse_stream_seconds
+        while not await request.is_disconnected() and asyncio.get_running_loop().time() < stream_deadline:
+            try:
+                pending = await asyncio.to_thread(repository.list_events, task["id"], cursor, 100)
+            except PersistenceError as exc:
+                data = {"code": "event_read_failed", "message": str(exc)}
+                yield f"event: stream_error\ndata: {json.dumps(data)}\n\n"
+                return
+            for event in pending:
+                cursor = int(event["sequence_no"])
+                payload = event.get("payload") or {}
+                yield f"event: {event['event_type']}\nid: {cursor}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            if pending:
+                idle_polls = 0
+                terminal_empty_polls = 0
+                continue
+            current = await _get_task_or_404(task["id"], repository)
+            if current.get("status") in terminal_statuses:
+                terminal_empty_polls += 1
+                if terminal_empty_polls >= 2:
+                    return
+            else:
+                terminal_empty_polls = 0
+            idle_polls += 1
+            if idle_polls >= 15:
+                yield ": keep-alive\n\n"
+                idle_polls = 0
+            await asyncio.sleep(1)
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
