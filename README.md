@@ -1,8 +1,8 @@
-# ProofLoop — Stage 2 setup (Windows)
+# ProofLoop â€” Stage 3 setup (Windows)
 
 Stage 2 adds the first live research workflow to the Stage 1 React/Vite and FastAPI foundation. The backend creates a structured plan with Ollama, searches with Tavily, reads public pages through Firecrawl, extracts fields with verbatim supporting excerpts, saves task/source/finding records in Supabase, and streams progress over SSE. Research values are source-supported, not independently cross-checked.
 
-Stage 3 recovery, retries, resumability and development fault injection; Stage 4 artifact generation; and Stage 5 MCP integration are not implemented.
+Stage 3 adds bounded provider retries, durable attempt and event history, safe task resumption, cancellation and development-only failure injection. Stage 4 artifact generation and Stage 5 MCP integrations are not implemented.
 
 ## Prerequisites
 
@@ -13,7 +13,7 @@ Stage 3 recovery, retries, resumability and development fault injection; Stage 4
 
 ## Configure Supabase
 
-In the Supabase SQL editor, run [`backend/supabase/migrations/20261015_stage2_research.sql`](backend/supabase/migrations/20261015_stage2_research.sql). It creates `research_tasks`, `research_steps`, `sources` and `findings`, with indexes, foreign keys, unique constraints and owner-scoped RLS policies.
+In the Supabase SQL editor, run [`backend/supabase/migrations/20261015_stage2_research.sql`](backend/supabase/migrations/20261015_stage2_research.sql), then [`backend/supabase/migrations/20261016_stage3_recovery.sql`](backend/supabase/migrations/20261016_stage3_recovery.sql), then [`backend/supabase/migrations/20261017_stage3_resume_claim.sql`](backend/supabase/migrations/20261017_stage3_resume_claim.sql). Stage 3 adds task leases/cancellation, attempt history, durable SSE events, supporting page content and database transition guards. Rollback scripts are provided alongside those migrations; reverse order is required. Apply migrations to the same project configured by `SUPABASE_URL`; after SQL Editor changes, allow PostgREST's schema cache to refresh before restarting the API.
 
 Stage 2 runs in documented local single-user mode: the backend uses its service-role key, and the API must remain bound to loopback (`127.0.0.1`). Authentication and ownership checks for a remotely exposed API are not implemented in this stage. Never put the service-role key in frontend configuration.
 
@@ -59,9 +59,9 @@ Open the Vite URL (normally `http://localhost:5173`). The frontend only reads `V
 
 ## Limits
 
-`backend/.env.example` documents all Stage 2 configuration. Search queries, pages per task, page-content length, total task duration, provider timeouts and concurrency are configurable. Concurrency defaults to one to limit load on the local model and external providers. This stage deliberately does not retry failed calls. A failed page is recorded as a limitation and the workflow continues with remaining candidates; search/planning or persistence failures fail the task.
+`backend/.env.example` documents all variables. Search query count, pages per task, page-content length, total task duration, provider timeouts, research concurrency, retry attempts and backoff are configurable. Concurrency defaults to one. `MAX_PROVIDER_ATTEMPTS` defaults to three; authentication, authorization and validation errors are not retried. Keep `FAILURE_INJECTION_ENABLED=false` except for local test runs. When explicitly enabled in development/test, the UI offers deterministic simulated failures; production requests reject failure injection.
 
-SSE progress is held in memory while the backend process runs. Completed task/source/finding records are persisted, but progress event history is not durable across backend restarts. Persistent resumability is Stage 3 work.
+Task attempts and SSE event history are persisted. Reconnecting clients replay from their last event sequence; task execution resumes through `POST /api/research/{task_id}/resume`, and cancellation is requested through `POST /api/research/{task_id}/cancel`. External GET calls may be repeated after an ambiguous outcome; source/finding writes use stable keys and reconciliation, so exactly-once provider execution is not claimed. The API uses service-role credentials in local single-user mode and is restricted to loopback. Do not expose it publicly without adding authenticated ownership enforcement.
 
 ## Tests and build
 
