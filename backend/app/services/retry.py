@@ -65,7 +65,9 @@ def classify_error(exc: BaseException) -> ErrorClassification:
     retry_after = _retry_after(exc)
 
     failure_kind = getattr(exc, "failure_kind", None)
-    if failure_kind == "validation" or isinstance(exc, ValidationError):
+    if failure_kind in {"validation", "timeout"} or isinstance(exc, ValidationError):
+        if failure_kind == "timeout":
+            return ErrorClassification("timeout", False)
         return ErrorClassification("validation", False)
 
     if isinstance(exc, (httpx.TimeoutException, TimeoutError)):

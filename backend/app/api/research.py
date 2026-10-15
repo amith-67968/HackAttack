@@ -14,7 +14,7 @@ from app.core.config import Settings, get_settings
 from app.repositories.tasks import PersistenceError, SupabaseTaskRepository
 from app.schemas.research import ResearchAccepted, ResearchRequest
 from app.schemas.artifacts import ArtifactRequest
-from app.services.artifacts import MIMES, artifact_filename, build_artifact, store_local
+from app.services.artifacts import generate_and_save_artifact
 from app.services.ollama import check_ollama
 from app.services.progress import ProgressHub, progress_hub
 from app.services.research_workflow import execute_research
@@ -232,33 +232,12 @@ async def create_research_artifact(task_id: str, body: ArtifactRequest, settings
     if body.recipient and not __import__("re").fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", body.recipient):
         raise HTTPException(status_code=422, detail="recipient must be a valid email address")
     try:
-        sources, findings = await asyncio.gather(
-            asyncio.to_thread(repository.list_sources, task["id"]),
-            asyncio.to_thread(repository.list_findings, task["id"]),
+        saved = await asyncio.to_thread(
+            generate_and_save_artifact, task, repository, settings,
+            body.artifact_type, body.recipient,
         )
-        payload, preview = build_artifact(task, findings, sources, body.artifact_type, body.recipient)
-        generation_key = f"{body.artifact_type}:{hashlib.sha256((body.recipient or '').encode()).hexdigest()[:16]}"
-        artifact_id = str(uuid5(NAMESPACE_URL, f"proofloop:{task['id']}:{generation_key}"))
-        filename = artifact_filename(body.artifact_type, task["id"])
-        backend = settings.artifact_storage_backend
-        if backend == "auto":
-            backend = "supabase" if settings.supabase_configured else "local"
-        if backend == "supabase":
-            if not settings.supabase_configured:
-                raise HTTPException(status_code=503, detail={"code": "artifact_storage_not_configured", "message": "Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY or set ARTIFACT_STORAGE_BACKEND=local."})
-            storage_path = f"{task['id']}/{artifact_id}/{filename}"
-            await asyncio.to_thread(repository.upload_artifact, settings.supabase_storage_bucket, storage_path, payload, MIMES[body.artifact_type])
-        else:
-            storage_path = await asyncio.to_thread(store_local, settings.artifact_dir, artifact_id, payload)
-        row = {
-            "id": artifact_id, "task_id": task["id"], "artifact_type": body.artifact_type,
-            "generation_key": generation_key, "filename": filename, "storage_backend": backend,
-            "storage_path": storage_path, "mime_type": MIMES[body.artifact_type], "status": "READY",
-            "preview": preview, "content_hash": hashlib.sha256(payload).hexdigest(),
-        }
-        saved = await asyncio.to_thread(repository.save_artifact, row)
         try:
-            await asyncio.to_thread(repository.append_event, task["id"], "artifact_generated", {"artifact_id": artifact_id, "artifact_type": body.artifact_type, "status": "READY"})
+            await asyncio.to_thread(repository.append_event, task["id"], "artifact_generated", {"artifact_id": saved["id"], "artifact_type": body.artifact_type, "status": "READY"})
         except Exception:
             pass
         return _artifact_public(saved)
@@ -269,6 +248,8 @@ async def create_research_artifact(task_id: str, body: ArtifactRequest, settings
         if "artifacts" in message.lower() or "PGRST205" in message:
             message = "Artifact table is unavailable. Apply backend/supabase/migrations/20261019_stage4_artifacts.sql to the configured Supabase project and refresh the PostgREST schema cache."
         raise HTTPException(status_code=503, detail={"code": "artifact_persistence_failed", "message": message}) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail={"code": "artifact_generation_failed", "message": str(exc)}) from exc
 
 
 @artifact_router.get("/artifacts/{artifact_id}/download")

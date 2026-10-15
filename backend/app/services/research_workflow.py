@@ -8,11 +8,12 @@ from uuid import uuid4
 
 import httpx
 
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.schemas.evidence import ExtractionResult
 from app.schemas.plan import ResearchPlan
 from app.schemas.research import ResearchRequest
 from app.services.extraction import extract_fields, finding_evidence_error
+from app.services.artifacts import generate_and_save_artifact
 from app.services.ollama import OllamaError
 from app.services.mcp_search import discover_and_search
 from app.services.planner import create_plan
@@ -700,6 +701,26 @@ async def execute_research(
                 "status": status, "summary": summary, "error_summary": "; ".join(dict.fromkeys(warnings))[:4000] or None,
                 "completed_at": utc_now(), "updated_at": utc_now(),
             })
+            output_type = task.get("output_type")
+            if output_type in {"spreadsheet", "report", "email"} and status != "CANCELLED":
+                final_task = {**task, "status": status, "summary": summary, "completed_at": utc_now()}
+                try:
+                    artifact = await asyncio.to_thread(
+                        generate_and_save_artifact, final_task, repository, settings, output_type,
+                    )
+                    await emit("artifact_generated", {
+                        "artifact_id": artifact["id"], "artifact_type": output_type, "status": "READY",
+                    })
+                except Exception as exc:
+                    # Keep the research outcome intact while making failed output
+                    # generation visible in the persisted activity history.
+                    try:
+                        await emit("artifact_generation_failed", {
+                            "artifact_type": output_type,
+                            "message": f"Could not generate the selected {output_type} deliverable ({exc.__class__.__name__}).",
+                        })
+                    except Exception:
+                        pass
             await emit("task_error" if status == "FAILED" else "task_completed", {
                 "status": status, "summary": summary, "sources_read": completed_sources,
                 "findings_saved": len(accepted_findings), "limitations": list(dict.fromkeys(warnings)),
@@ -804,12 +825,41 @@ async def _fail_task(
         safe_message = f"Research task failed during {classification}: {message[:300]}"
     else:
         safe_message = "Research task failed due to an unexpected workflow error."
+    task_finalized = False
     try:
         await _persist(repository, "update_task", task_id, {
             "status": "FAILED", "error_summary": safe_message, "completed_at": utc_now(), "updated_at": utc_now(),
         })
+        task_finalized = True
     except Exception:
         pass
+    if task_finalized:
+        output_type = None
+        try:
+            task = await _persist(repository, "get_task", task_id)
+            output_type = task.get("output_type") if task else None
+            if output_type in {"spreadsheet", "report", "email"}:
+                artifact = await asyncio.to_thread(
+                    generate_and_save_artifact, task, repository, get_settings(), output_type,
+                )
+                event = await _persist(repository, "append_event", task_id, "artifact_generated", {
+                    "task_id": task_id, "artifact_id": artifact["id"],
+                    "artifact_type": output_type, "status": "READY",
+                })
+                await hub.publish(task_id, "artifact_generated", {
+                    "task_id": task_id, "artifact_id": artifact["id"],
+                    "artifact_type": output_type, "status": "READY",
+                }, event_id=event.get("sequence_no"))
+        except Exception as exc:
+            try:
+                event_data = {
+                    "task_id": task_id, "artifact_type": output_type,
+                    "message": f"Could not generate the selected deliverable ({exc.__class__.__name__}).",
+                }
+                event = await _persist(repository, "append_event", task_id, "artifact_generation_failed", event_data)
+                await hub.publish(task_id, "artifact_generation_failed", event_data, event_id=event.get("sequence_no"))
+            except Exception:
+                pass
     try:
         if hasattr(repository, "append_event"):
             event = await _persist(repository, "append_event", task_id, "task_error", {"task_id": task_id, "status": "FAILED", "message": safe_message})

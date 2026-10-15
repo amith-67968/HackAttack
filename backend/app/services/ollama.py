@@ -114,5 +114,11 @@ async def generate_structured(
         reason = "model not found" if status == 404 else "request or response validation failed"
         response = getattr(exc, "response", None)
         retry_after = getattr(response, "headers", {}).get("Retry-After") if response is not None else None
-        kind = "provider" if isinstance(exc, httpx.HTTPError) else "validation"
+        # A local model generation that exceeded its full response deadline is
+        # expensive to repeat with the same prompt and model. Let the workflow
+        # mark this source as limited and continue with the remaining sources.
+        # Connection errors remain retryable because they can be transient.
+        kind = "timeout" if isinstance(exc, httpx.TimeoutException) else (
+            "provider" if isinstance(exc, httpx.HTTPError) else "validation"
+        )
         raise OllamaError(f"Ollama {reason}: {status or exc.__class__.__name__}", status, retry_after, failure_kind=kind) from exc

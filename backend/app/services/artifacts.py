@@ -1,7 +1,9 @@
 import io
+import hashlib
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import NAMESPACE_URL, uuid5
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -135,3 +137,35 @@ def store_local(root: str, artifact_id: str, payload: bytes) -> str:
         raise ValueError("Artifact path escaped configured storage directory")
     path.write_bytes(payload)
     return str(path)
+
+
+def generate_and_save_artifact(task: dict, repository, settings, artifact_type: str, recipient: str | None = None) -> dict:
+    """Build and persist one deliverable from a task's already saved evidence."""
+    task_id = str(task["id"])
+    generation_key = f"{artifact_type}:{hashlib.sha256((recipient or '').encode()).hexdigest()[:16]}"
+    artifact_id = str(uuid5(NAMESPACE_URL, f"proofloop:{task_id}:{generation_key}"))
+    existing = repository.get_artifact(artifact_id)
+    if existing:
+        return existing
+
+    sources = repository.list_sources(task_id)
+    findings = repository.list_findings(task_id)
+    payload, preview = build_artifact(task, findings, sources, artifact_type, recipient)
+    filename = artifact_filename(artifact_type, task_id)
+    backend = settings.artifact_storage_backend
+    if backend == "auto":
+        backend = "supabase" if settings.supabase_configured else "local"
+    if backend == "supabase":
+        if not settings.supabase_configured:
+            raise ValueError("Artifact storage is not configured")
+        storage_path = f"{task_id}/{artifact_id}/{filename}"
+        repository.upload_artifact(settings.supabase_storage_bucket, storage_path, payload, MIMES[artifact_type])
+    else:
+        storage_path = store_local(settings.artifact_dir, artifact_id, payload)
+    row = {
+        "id": artifact_id, "task_id": task_id, "artifact_type": artifact_type,
+        "generation_key": generation_key, "filename": filename, "storage_backend": backend,
+        "storage_path": storage_path, "mime_type": MIMES[artifact_type], "status": "READY",
+        "preview": preview, "content_hash": hashlib.sha256(payload).hexdigest(),
+    }
+    return repository.save_artifact(row)

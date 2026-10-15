@@ -40,6 +40,7 @@ export function useResearchEvents(taskId) {
     if (!taskId) return undefined
     let source
     let closed = false
+    let refreshTimer
     setEvents([])
     setTask(null)
     setLiveStatus('QUEUED')
@@ -55,26 +56,37 @@ export function useResearchEvents(taskId) {
       source.onopen = () => { if (!closed) { setReconnecting(false); setConnectionError('') } }
       eventTypes.forEach((type) => source.addEventListener(type, async (event) => {
         const data = JSON.parse(event.data)
-        if (data.status) {
+        // Tool and step events also carry a `status` field (for example,
+        // tool_call_finished: SUCCEEDED). Those statuses must not overwrite
+        // the persisted research task status shown in the header.
+        if (data.status && ['task_status', 'task_completed', 'task_error', 'task_resumed', 'recovery_started', 'worker_interrupted'].includes(type)) {
           setLiveStatus(data.status)
           setTask((current) => current ? { ...current, ...data, status: data.status } : current)
         }
         const id = event.lastEventId || `${Date.now()}`
         setEvents((current) => current.some((item) => item.id === id && item.type === type) ? current : [...current, { id, type, data }])
         if (['task_completed', 'task_error'].includes(type) || (type === 'task_status' && ['COMPLETED', 'COMPLETED_WITH_LIMITATIONS', 'FAILED', 'CANCELLED'].includes(data.status))) {
+          clearTimeout(refreshTimer)
           source.close()
           try { if (!closed) await refreshSaved() }
           catch (error) { if (!closed) setConnectionError(error.message) }
         } else if (type === 'worker_interrupted') {
           try { if (!closed) await refreshSaved() }
           catch (error) { if (!closed) setConnectionError(error.message) }
+        } else if (['source_discovered', 'step_started', 'step_completed', 'step_failed', 'finding_extracted', 'finding_rejected', 'verification_result'].includes(type)) {
+          // Keep counters and persisted step statuses in sync with activity,
+          // while coalescing bursts such as a batch of discovered sources.
+          clearTimeout(refreshTimer)
+          refreshTimer = setTimeout(() => {
+            if (!closed) refreshSaved().catch((error) => setConnectionError(error.message))
+          }, 250)
         }
       }))
       source.onerror = () => {
         if (!closed) { setReconnecting(true); setConnectionError('Live progress connection interrupted. Reconnecting and replaying saved task events…') }
       }
     } catch (error) { setConnectionError(error.message) }
-    return () => { closed = true; source?.close() }
+    return () => { closed = true; clearTimeout(refreshTimer); source?.close() }
   }, [taskId, refreshSaved, reconnectVersion])
 
   return { events, task, sources, findings, steps, connectionError, liveStatus, reconnecting, refreshSaved, reconnect }

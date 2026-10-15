@@ -128,6 +128,42 @@ describe('ProofLoop research journey', () => {
     expect(window.location.pathname).toBe(`/research/${taskId}/results`)
   })
 
+  it('keeps task status separate from tool status and refreshes persisted counters during live work', async () => {
+    const runningTask = { ...completedTask, status: 'RUNNING', resume_eligible: false, cancel_eligible: true }
+    let sources = []
+    let findings = []
+    let steps = [{ id: 'plan', action_key: 'create_plan', title: 'Create a plan', status: 'VERIFIED' }]
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      const url = new URL(String(input), 'http://localhost')
+      if (url.pathname === `/api/research/${taskId}`) return response(runningTask)
+      if (url.pathname === `/api/research/${taskId}/sources`) return response({ sources })
+      if (url.pathname === `/api/research/${taskId}/findings`) return response({ findings })
+      if (url.pathname === `/api/research/${taskId}/steps`) return response({ steps })
+      if (url.pathname === '/api/health') return response(health)
+      if (url.pathname === '/api/sources') return response({ sources: [] })
+      return response({ tasks: [] })
+    }))
+    goto(`/research/${taskId}/progress`)
+    render(<App />)
+    expect(await screen.findByText('Researching')).toBeInTheDocument()
+    expect(screen.getAllByText('0', { selector: '.progress-stats strong' })).toHaveLength(2)
+    expect(screen.getAllByText('1', { selector: '.progress-stats strong' })).toHaveLength(1)
+
+    FakeEventSource.latest.emit('tool_call_finished', { status: 'SUCCEEDED', tool: 'ollama_extract' }, '2')
+    expect(screen.getByText('Researching')).toBeInTheDocument()
+    expect(screen.queryByText('Succeeded')).not.toBeInTheDocument()
+
+    sources = [savedSource]
+    findings = [savedFinding]
+    steps = [...steps, { id: 'read-1', action_key: 'read_one', title: 'Read a source', status: 'VERIFIED' }]
+    FakeEventSource.latest.emit('step_completed', { status: 'VERIFIED', step_id: 'read_one' }, '3')
+    await waitFor(() => {
+      expect(screen.getAllByText('2', { selector: '.progress-stats strong' })).toHaveLength(1)
+      expect(screen.getAllByText('1', { selector: '.progress-stats strong' })).toHaveLength(2)
+    })
+    expect(screen.getByText('Researching')).toBeInTheDocument()
+  })
+
   it('renders source-backed findings, limitations, and can generate a saved report', async () => {
     const failedTask = { ...completedTask, status: 'COMPLETED_WITH_LIMITATIONS', error_summary: 'Some requested fields were not found.' }
     const fetchMock = mockApi({ task: failedTask, sources: [savedSource], findings: [savedFinding], artifacts: [] })

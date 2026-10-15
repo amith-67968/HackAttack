@@ -237,7 +237,10 @@ async def test_ollama_plan_provider_and_output_failures_are_classified(failure, 
             settings, system="system", prompt="prompt", schema=ResearchPlan,
             transport=httpx.MockTransport(handler),
         )
-    assert classify_error(caught.value).name == classification
+    error_classification = classify_error(caught.value)
+    assert error_classification.name == classification
+    if classification == "timeout":
+        assert error_classification.retryable is False
 
 
 @pytest.mark.asyncio
@@ -272,19 +275,20 @@ def test_extraction_chunking_keeps_small_pages_and_selects_relevant_oversized_se
 
 
 @pytest.mark.asyncio
-async def test_ollama_timeout_error_is_retryable_then_succeeds():
+async def test_ollama_generation_timeout_is_not_retried():
     calls = 0
     async def operation():
         nonlocal calls
         calls += 1
-        if calls == 1:
-            raise OllamaError("Ollama request failed", failure_kind="provider") from httpx.ReadTimeout("timeout")
-        return ExtractionResult(findings=[])
+        raise OllamaError("Ollama request failed", failure_kind="timeout") from httpx.ReadTimeout("timeout")
     async def noop(*_args): pass
-    result = await run_with_retries(operation, max_attempts=3, base_seconds=0, max_seconds=0,
-        on_start=noop, on_attempt=noop, on_retry=noop, sleep=noop)
-    assert isinstance(result, ExtractionResult)
-    assert calls == 2
+    with pytest.raises(OllamaError):
+        await run_with_retries(operation, max_attempts=3, base_seconds=0, max_seconds=0,
+            on_start=noop, on_attempt=noop, on_retry=noop, sleep=noop)
+    assert calls == 1
+    classification = classify_error(OllamaError("Ollama request failed", failure_kind="timeout"))
+    assert classification.name == "timeout"
+    assert classification.retryable is False
 
 
 @pytest.mark.asyncio
@@ -344,17 +348,18 @@ async def test_extraction_checks_cancellation_between_chunks(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_planner_normalizes_model_field_lists_to_validated_request_fields(monkeypatch):
-    plan = valid_plan()
-    plan.actions[0].expected_result.required_fields = ["name", ": ", "price"]
-
-    async def fake_generate(*_args, **_kwargs):
-        return plan
-
-    monkeypatch.setattr(planner_service, "generate_structured", fake_generate)
-    request = ResearchRequest(query="Find clinic name and consultation price", options={"required_fields": ["name", "price"]})
-    normalized = await planner_service.create_plan(Settings(_env_file=None), request)
-    assert normalized.actions[0].expected_result.required_fields == ["name", "price"]
+async def test_planner_builds_valid_plan_without_local_model_and_preserves_request_scope():
+    request = ResearchRequest(
+        query="Find clinic consultation prices",
+        options={"required_fields": ["name", "price"], "location": "Bengaluru", "domain": "example.org"},
+    )
+    plan = await planner_service.create_plan(Settings(_env_file=None), request)
+    assert plan.topic == request.query
+    assert plan.required_fields == ["name", "price"]
+    assert plan.actions[0].expected_result.required_fields == ["name", "price"]
+    assert plan.actions[0].query == "Find clinic consultation prices Bengaluru"
+    assert plan.actions[0].required_tool == "tavily_search"
+    assert len(plan.actions) == 1
 
 
 @pytest.mark.asyncio
@@ -432,6 +437,7 @@ class MemoryRepository:
         self.findings = {}
         self.attempts = {}
         self.events = {}
+        self.artifacts = {}
         self.claimed = set()
         self.lock = threading.RLock()
 
@@ -592,6 +598,16 @@ class MemoryRepository:
     def list_findings(self, task_id):
         return [row for row in self.findings.values() if row["task_id"] == task_id]
 
+    def get_artifact(self, artifact_id):
+        return self.artifacts.get(artifact_id)
+
+    def save_artifact(self, row):
+        self.artifacts[row["id"]] = dict(row)
+        return self.artifacts[row["id"]]
+
+    def upload_artifact(self, *_args):
+        raise AssertionError("local artifact storage should be used")
+
 
 @pytest.mark.asyncio
 async def test_workflow_searches_reads_extracts_and_streams_mocked_evidence(monkeypatch):
@@ -650,6 +666,35 @@ async def test_workflow_searches_reads_extracts_and_streams_mocked_evidence(monk
     search_started = next(i for i, event in enumerate(hub.history(task_id))
                           if event["event"] == "tool_call_started" and event["data"].get("tool") == "mcp_tavily_search")
     assert plan_transition < search_started
+
+
+@pytest.mark.asyncio
+async def test_workflow_generates_selected_deliverable_after_research_finishes(monkeypatch, tmp_path):
+    request = ResearchRequest(query="Find project ideas", output_type="report")
+    settings = Settings(_env_file=None, artifact_storage_backend="local", artifact_dir=str(tmp_path), max_provider_attempts=1)
+    repository = MemoryRepository()
+    task_id = str(uuid4())
+    repository.create_task({"id": task_id, "query": request.query, "output_type": "report", "status": "QUEUED"})
+    hub = ProgressHub()
+
+    async def fake_plan(_settings, _request): return valid_plan()
+
+    class NoResultsSearch:
+        def __init__(self, *_args): pass
+        async def search(self, *_args, **_kwargs): return []
+
+    monkeypatch.setattr(research_workflow, "create_plan", fake_plan)
+    monkeypatch.setattr(research_workflow, "TavilySearch", NoResultsSearch)
+    await research_workflow.execute_research(task_id, request, settings, repository, hub)
+
+    assert repository.tasks[task_id]["status"] == "COMPLETED_WITH_LIMITATIONS"
+    assert len(repository.artifacts) == 1
+    artifact = next(iter(repository.artifacts.values()))
+    assert artifact["artifact_type"] == "report"
+    assert artifact["status"] == "READY"
+    assert __import__("pathlib").Path(artifact["storage_path"]).exists()
+    event_types = [event["event"] for event in hub.history(task_id)]
+    assert event_types[-2:] == ["artifact_generated", "task_completed"]
 
 
 @pytest.mark.asyncio
