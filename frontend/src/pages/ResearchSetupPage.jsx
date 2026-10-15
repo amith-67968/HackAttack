@@ -21,7 +21,7 @@ export default function ResearchSetupPage({ navigate }) {
   const [domain, setDomain] = useState('')
   const [fields, setFields] = useState('')
   const [depth, setDepth] = useState('standard')
-  const [outputType, setOutputType] = useState('auto')
+  const [outputType, setOutputType] = useState('')
   const [materials, setMaterials] = useState([])
   const [filesError, setFilesError] = useState('')
   const [urls, setUrls] = useState([])
@@ -82,6 +82,8 @@ export default function ResearchSetupPage({ navigate }) {
   async function startResearch(event) {
     event.preventDefault()
     if (query.trim().length < 5) { setError('Add a research question with at least five characters.'); setStep(0); return }
+    if (!outputType) { setError('Choose an output format before starting research.'); return }
+    if (submitting) return
     setSubmitting(true)
     setError('')
     try {
@@ -132,17 +134,17 @@ export default function ResearchSetupPage({ navigate }) {
 
       {step === 2 && <div className="setup-panel">
         <div className="panel-heading"><span className="panel-index">03</span><div><h3>Choose a useful output</h3><p>All deliverables are generated from the saved research evidence after the run.</p></div></div>
-        <div className="output-options" role="radiogroup" aria-label="Output format">{[
+        <div className="output-options" role="radiogroup" aria-label="Output format" aria-required="true">{[
           ['auto', 'Choose for me', 'Use the format implied by my request.'],
           ['spreadsheet', 'Spreadsheet', 'Structured findings and source links in XLSX.'],
           ['report', 'Research report', 'A Markdown report with evidence and limitations.'],
           ['email', 'Email draft', 'An editable summary draft. Nothing is sent.'],
-        ].map(([value, title, description]) => <label key={value} className={`output-option ${outputType === value ? 'selected' : ''}`}><input type="radio" name="output" value={value} checked={outputType === value} onChange={() => setOutputType(value)} /><span className="radio-mark" /><span><strong>{title}</strong><small>{description}</small></span></label>)}</div>
-        <div className="request-summary"><div className="eyebrow">READY TO START</div><p className="summary-query">“{query.trim()}”</p><div className="summary-chips"><span>{depth} depth</span><span>{outputType === 'auto' ? 'Automatic format' : outputType}</span>{location && <span>{location}</span>}{targetCount && <span>{targetCount} target results</span>}{urls.length > 0 && <span>{urls.length} reference URL{urls.length === 1 ? '' : 's'}</span>}{materials.length > 0 && <span>{materials.length} text file{materials.length === 1 ? '' : 's'}</span>}</div></div>
+        ].map(([value, title, description]) => <label key={value} className={`output-option ${outputType === value ? 'selected' : ''}`}><input type="radio" name="output" value={value} checked={outputType === value} onChange={() => { setOutputType(value); setError('') }} /><span className="radio-mark" /><span><strong>{title}</strong><small>{description}</small></span></label>)}</div>
+        <div className="request-summary"><div className="eyebrow">{outputType ? 'READY TO START' : 'OUTPUT FORMAT REQUIRED'}</div><p className="summary-query">“{query.trim()}”</p><div className="summary-chips"><span>{depth} depth</span><span>{!outputType ? 'Choose an output format' : outputType === 'auto' ? 'Automatic format' : outputType}</span>{location && <span>{location}</span>}{targetCount && <span>{targetCount} target results</span>}{urls.length > 0 && <span>{urls.length} reference URL{urls.length === 1 ? '' : 's'}</span>}{materials.length > 0 && <span>{materials.length} text file{materials.length === 1 ? '' : 's'}</span>}</div></div>
       </div>}
 
       {error && <div className="inline-error" role="alert"><strong>{submitting ? 'Starting research…' : 'Could not start research'}</strong><span>{error}</span></div>}
-      <div className="wizard-actions">{step > 0 && <button type="button" className="button button-quiet" onClick={() => { setError(''); setStep((current) => current - 1) }}><ArrowLeft size={16} /> Back</button>}<span className="wizard-spacer" />{step < 2 ? <button type="button" className="button button-primary" onClick={continueStep}>Continue <ArrowRight size={16} /></button> : <button type="submit" className="button button-primary" disabled={submitting}>{submitting ? <LoaderCircle className="spin" size={16} /> : <ArrowRight size={16} />}{submitting ? 'Creating task…' : 'Start research'}</button>}</div>
+      <div className="wizard-actions">{step > 0 && <button type="button" className="button button-quiet" onClick={() => { setError(''); setStep((current) => current - 1) }}><ArrowLeft size={16} /> Back</button>}<span className="wizard-spacer" />{step < 2 ? <button type="button" className="button button-primary" onClick={continueStep}>Continue <ArrowRight size={16} /></button> : <button type="submit" className="button button-primary" disabled={submitting || !outputType}>{submitting ? <LoaderCircle className="spin" size={16} /> : <ArrowRight size={16} />}{submitting ? 'Creating task…' : 'Start research'}</button>}</div>
       <p className="privacy-note">Queries are sent to Tavily. Candidate pages and content are processed by Firecrawl. Uploaded text is stored with your task in Supabase.</p>
     </form>
   </section>

@@ -219,6 +219,42 @@ async def test_ollama_structured_plan_uses_configured_model_and_pydantic_schema(
     assert result.actions[0].required_tool == "tavily_search"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure, classification", [
+    (httpx.ReadTimeout("slow model"), "timeout"),
+    (None, "validation"),
+    (httpx.ConnectError("offline"), "connection"),
+])
+async def test_ollama_plan_provider_and_output_failures_are_classified(failure, classification):
+    async def handler(_request):
+        if failure is not None:
+            raise failure
+        return httpx.Response(200, json={"response": "not valid json"})
+
+    settings = Settings(_env_file=None, ollama_base_url="http://ollama.test", max_ollama_concurrency=2)
+    with pytest.raises(OllamaError) as caught:
+        await generate_structured(
+            settings, system="system", prompt="prompt", schema=ResearchPlan,
+            transport=httpx.MockTransport(handler),
+        )
+    assert classify_error(caught.value).name == classification
+
+
+@pytest.mark.asyncio
+async def test_ollama_plan_http_provider_failure_is_reported_without_response_body():
+    async def handler(_request):
+        return httpx.Response(503, json={"secret": "provider body"})
+
+    settings = Settings(_env_file=None, ollama_base_url="http://ollama.test")
+    with pytest.raises(OllamaError) as caught:
+        await generate_structured(
+            settings, system="system", prompt="prompt", schema=ResearchPlan,
+            transport=httpx.MockTransport(handler),
+        )
+    assert classify_error(caught.value).name == "temporary_server_error"
+    assert "provider body" not in str(caught.value)
+
+
 def test_extraction_chunking_keeps_small_pages_and_selects_relevant_oversized_sections():
     from app.services.extraction import prepare_extraction_chunks
     small = "NASA mission statement is to explore space."
@@ -609,6 +645,11 @@ async def test_workflow_searches_reads_extracts_and_streams_mocked_evidence(monk
     assert "finding_extracted" in event_types
     assert "rate_limited" in repository.tasks[task_id]["error_summary"]
     assert event_types[-1] == "task_completed"
+    plan_transition = next(i for i, event in enumerate(hub.history(task_id))
+                           if event["event"] == "task_status" and event["data"].get("status") == "RUNNING")
+    search_started = next(i for i, event in enumerate(hub.history(task_id))
+                          if event["event"] == "tool_call_started" and event["data"].get("tool") == "mcp_tavily_search")
+    assert plan_transition < search_started
 
 
 @pytest.mark.asyncio
@@ -651,6 +692,64 @@ async def test_workflow_persists_user_urls_and_uploads_as_research_sources(monke
     assert uploaded["fetch_status"] == "retrieved"
     assert reference["canonical_url"] == "https://example.org/reference"
     assert reference["fetch_status"] == "retrieved"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure, classification", [
+    (OllamaError("Ollama request failed: ReadTimeout", failure_kind="provider"), "timeout"),
+    (OllamaError("Ollama returned structured output that failed schema validation", failure_kind="validation"), "validation"),
+    (OllamaError("Ollama request failed: ConnectError", failure_kind="provider"), "connection"),
+])
+async def test_planner_failures_persist_terminal_task_step_attempt_and_event(monkeypatch, failure, classification):
+    request = ResearchRequest(query="Find clinic consultation price", options={"required_fields": ["price"]})
+    settings = Settings(_env_file=None, max_provider_attempts=1, retry_base_delay_seconds=0, retry_max_delay_seconds=0)
+    repository = MemoryRepository()
+    task_id = str(uuid4())
+    repository.create_task({"id": task_id, "query": request.query, "status": "QUEUED"})
+    hub = ProgressHub()
+
+    async def failed_plan(_settings, _request):
+        if classification == "timeout":
+            raise failure from httpx.ReadTimeout("slow model")
+        if classification == "connection":
+            raise failure from httpx.ConnectError("offline")
+        raise failure
+
+    monkeypatch.setattr(research_workflow, "create_plan", failed_plan)
+    await research_workflow.execute_research(task_id, request, settings, repository, hub)
+
+    assert repository.tasks[task_id]["status"] == "FAILED"
+    assert classification in repository.tasks[task_id]["error_summary"]
+    assert repository.steps["create_plan"]["status"] == "FAILED"
+    assert repository.steps["create_plan"]["last_error_classification"] == classification
+    assert all(attempt["status"] == "FAILED" for attempt in repository.list_attempts(task_id))
+    assert hub.history(task_id)[-1]["event"] == "task_error"
+
+
+@pytest.mark.asyncio
+async def test_unexpected_failure_after_attempt_start_closes_running_step(monkeypatch):
+    request = ResearchRequest(query="Find clinic consultation price", options={"required_fields": ["price"]})
+    settings = Settings(_env_file=None, max_provider_attempts=1)
+    repository = MemoryRepository()
+    task_id = str(uuid4())
+    repository.create_task({"id": task_id, "query": request.query, "status": "QUEUED"})
+    hub = ProgressHub()
+
+    async def valid_fake_plan(_settings, _request): return valid_plan()
+    monkeypatch.setattr(research_workflow, "create_plan", valid_fake_plan)
+    original_append = repository.append_event
+
+    def fail_after_attempt_start(task, event_type, payload):
+        if event_type == "tool_call_started":
+            raise RuntimeError("simulated event persistence failure")
+        return original_append(task, event_type, payload)
+
+    monkeypatch.setattr(repository, "append_event", fail_after_attempt_start)
+    await research_workflow.execute_research(task_id, request, settings, repository, hub)
+
+    assert repository.tasks[task_id]["status"] == "FAILED"
+    assert repository.steps["create_plan"]["status"] == "FAILED"
+    assert all(attempt["status"] != "RUNNING" for attempt in repository.list_attempts(task_id))
 
 
 def test_supabase_repository_crud_uses_expected_tables_and_upsert_keys():

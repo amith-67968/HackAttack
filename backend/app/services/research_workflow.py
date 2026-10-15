@@ -722,7 +722,11 @@ async def execute_research(
         except Exception as exc:
             await _fail_task(task_id, f"Cancellation finalization failed ({exc.__class__.__name__})", repository, hub)
     except asyncio.TimeoutError:
-        if await _cancel_requested(repository, task_id):
+        try:
+            cancellation_pending = await _cancel_requested(repository, task_id)
+        except Exception:
+            cancellation_pending = False
+        if cancellation_pending:
             try:
                 await _persist(repository, "finish_cancellation", task_id, worker_id)
                 await emit_safely("task_status", {"status": "CANCELLED", "message": "Cancellation was pending when the worker deadline elapsed."})
@@ -730,7 +734,10 @@ async def execute_research(
                 await _fail_task(task_id, f"Cancellation finalization failed ({exc.__class__.__name__})", repository, hub)
         else:
             await _record_timeout_outcomes(task_id, repository)
-            await _fail_task(task_id, f"Task exceeded MAX_TASK_DURATION_SECONDS ({settings.max_task_duration_seconds})", repository, hub)
+            await _fail_task(
+                task_id, f"Task exceeded MAX_TASK_DURATION_SECONDS ({settings.max_task_duration_seconds})",
+                repository, hub, classification="timeout",
+            )
     except Exception as exc:
         try:
             cancelled = await _cancel_requested(repository, task_id)
@@ -743,7 +750,11 @@ async def execute_research(
             except Exception as finalize_exc:
                 await _fail_task(task_id, f"Cancellation finalization failed ({finalize_exc.__class__.__name__})", repository, hub)
         else:
-            await _fail_task(task_id, str(exc)[:1000] or exc.__class__.__name__, repository, hub)
+            classification = classify_error(exc)
+            await _fail_task(
+                task_id, safe_error_text(exc, classification), repository, hub,
+                classification=classification.name,
+            )
     finally:
         if hasattr(repository, "release_task"):
             try:
@@ -757,11 +768,42 @@ async def _cancel_requested(repository: Any, task_id: str) -> bool:
     return bool(task and task.get("cancel_requested"))
 
 
-async def _fail_task(task_id: str, message: str, repository: Any, hub: ProgressHub) -> None:
-    safe_message = (
-        message if message.startswith("Supabase ") or message.startswith("Task exceeded MAX_TASK_DURATION_SECONDS")
-        else "Unexpected workflow failure; inspect the persisted step attempts for safe diagnostics."
-    )
+async def _fail_task(
+    task_id: str,
+    message: str,
+    repository: Any,
+    hub: ProgressHub,
+    *,
+    classification: str = "unknown",
+) -> None:
+    # Close durable work rows left active by an exception between attempt start
+    # and its normal completion callback. This also covers planner errors.
+    now = utc_now()
+    try:
+        if hasattr(repository, "list_attempts"):
+            for attempt in await _persist(repository, "list_attempts", task_id):
+                if attempt.get("status") == "RUNNING":
+                    await _persist(repository, "update_attempt", attempt["id"], {
+                        "status": "FAILED", "error_classification": classification,
+                        "safe_error": f"{classification} workflow failure", "completed_at": now,
+                    })
+        if hasattr(repository, "list_steps"):
+            for step in await _persist(repository, "list_steps", task_id):
+                if step.get("status") == "RUNNING":
+                    await _persist(repository, "update_step", task_id, step["action_key"], {
+                        "status": "FAILED", "last_error_classification": classification,
+                        "last_error": f"{classification} workflow failure",
+                        "completed_at": now, "updated_at": now,
+                    })
+    except Exception:
+        # A persistence outage may prevent cleanup; still attempt task finalization.
+        pass
+    if message.startswith("Supabase ") or message.startswith("Task exceeded MAX_TASK_DURATION_SECONDS"):
+        safe_message = message
+    elif classification in {"timeout", "validation", "provider", "temporary_server_error", "connection", "authorization"}:
+        safe_message = f"Research task failed during {classification}: {message[:300]}"
+    else:
+        safe_message = "Research task failed due to an unexpected workflow error."
     try:
         await _persist(repository, "update_task", task_id, {
             "status": "FAILED", "error_summary": safe_message, "completed_at": utc_now(), "updated_at": utc_now(),
